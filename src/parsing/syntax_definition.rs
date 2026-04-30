@@ -198,9 +198,19 @@ pub enum ContextReference {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MatchOperation {
-    Push(Vec<ContextReference>),
+    /// Pushes `ctx_refs`, optionally popping `pop_count` contexts first.
+    /// A plain `push:` is `pop_count == 0`; `pop: N + push:` is
+    /// `pop_count == N`. Per ST, `pop:N + push:` is **lookahead**: the
+    /// trigger token does not inherit the popped frames' meta_scope.
+    Push {
+        ctx_refs: Vec<ContextReference>,
+        #[serde(default)]
+        pop_count: usize,
+    },
     /// Pops `pop_count` contexts off the stack, then pushes `ctx_refs`.
     /// A plain `set:` is `pop_count == 1`; `pop: N + set:` is `pop_count == N`.
+    /// Per ST, `pop:N + set:` is **stacking**: the trigger token receives
+    /// both the popped frames' meta_scope and the pushed meta_scope.
     Set {
         ctx_refs: Vec<ContextReference>,
         #[serde(default = "one")]

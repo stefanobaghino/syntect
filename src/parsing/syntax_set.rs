@@ -460,7 +460,10 @@ impl SyntaxSet {
         for pattern in context.patterns.iter() {
             let maybe_refs_to_check = match pattern {
                 Pattern::Match(match_pat) => match &match_pat.operation {
-                    MatchOperation::Push(context_refs)
+                    MatchOperation::Push {
+                        ctx_refs: context_refs,
+                        ..
+                    }
                     | MatchOperation::Set {
                         ctx_refs: context_refs,
                         ..
@@ -1202,7 +1205,10 @@ impl SyntaxSetBuilder {
                 // This is really weird, but necessary to run the YAML syntax.
                 Pattern::Match(ref match_pat) => {
                     let maybe_context_refs = match match_pat.operation {
-                        MatchOperation::Push(ref context_refs)
+                        MatchOperation::Push {
+                            ctx_refs: ref context_refs,
+                            ..
+                        }
                         | MatchOperation::Set {
                             ctx_refs: ref context_refs,
                             ..
@@ -1400,7 +1406,10 @@ impl SyntaxSetBuilder {
         syntaxes: &[SyntaxReference],
     ) {
         let maybe_context_refs = match match_pat.operation {
-            MatchOperation::Push(ref mut context_refs)
+            MatchOperation::Push {
+                ctx_refs: ref mut context_refs,
+                ..
+            }
             | MatchOperation::Set {
                 ctx_refs: ref mut context_refs,
                 ..

@@ -788,7 +788,7 @@ impl ParseState {
                 // e.g. non-consuming "set" could also result in a loop.
                 if matches!(
                     match_pattern.operation,
-                    MatchOperation::Push(_)
+                    MatchOperation::Push { .. }
                         | MatchOperation::Branch { .. }
                         | MatchOperation::Embed { .. }
                 ) {
@@ -990,7 +990,7 @@ impl ParseState {
 
                         let push_too_deep = matches!(
                             match_pat.operation,
-                            MatchOperation::Push(_)
+                            MatchOperation::Push { .. }
                                 | MatchOperation::Branch { .. }
                                 | MatchOperation::Embed { .. }
                         ) && self.stack.len() >= 100;
@@ -1093,7 +1093,7 @@ impl ParseState {
             // this is necessary to avoid infinite looping on dumb patterns
             let does_something = match match_pat.operation {
                 MatchOperation::None => match_start != match_end,
-                MatchOperation::Push(_)
+                MatchOperation::Push { .. }
                 | MatchOperation::Branch { .. }
                 | MatchOperation::Embed { .. } => self.stack.len() < 100,
                 _ => true,
@@ -1218,15 +1218,30 @@ impl ParseState {
                         .unwrap_or_default(),
                 };
                 self.branch_points.push(bp);
-                // When pop_count > 0 (pop + branch), use Set semantics to
+                // When pop_count > 0 (pop + branch), reuse the Set arm to
                 // pop the current context before pushing the first alternative.
+                //
+                // TODO: per ST's "pop happens first, match is lookahead" rule,
+                // `pop: N + branch:` should be **lookahead** — the trigger
+                // token must NOT inherit the popped frames' meta_scope. The
+                // synthetic `Set { pop_count }` here gives stacking
+                // semantics instead, mirroring the historical conflation
+                // that `pop: N + push:` had before the IR split. The fix
+                // follows the same pattern: extend `Branch.alternatives`
+                // dispatch to the lookahead path. Tracked separately. The
+                // analogous comment at the `Embed` synthetic site below and
+                // at the safety-fallback synthetic-Branch arm in
+                // `push_meta_ops` applies.
                 synthetic_op = if pop_count > 0 {
                     MatchOperation::Set {
                         ctx_refs: vec![alternatives[0].clone()],
                         pop_count,
                     }
                 } else {
-                    MatchOperation::Push(vec![alternatives[0].clone()])
+                    MatchOperation::Push {
+                        ctx_refs: vec![alternatives[0].clone()],
+                        pop_count: 0,
+                    }
                 };
             } else {
                 unreachable!()
@@ -1781,7 +1796,10 @@ impl ParseState {
                     pop_count,
                 }
             } else {
-                MatchOperation::Push(vec![next_alt.clone()])
+                MatchOperation::Push {
+                    ctx_refs: vec![next_alt.clone()],
+                    pop_count: 0,
+                }
             };
             let level_ctx_id = stack_snapshot.last().map(|l| l.context);
             let post_set_stack = std::mem::replace(&mut self.stack, stack_snapshot.clone());
@@ -1975,7 +1993,10 @@ impl ParseState {
                     pop_count,
                 }
             } else {
-                MatchOperation::Push(vec![next_alt.clone()])
+                MatchOperation::Push {
+                    ctx_refs: vec![next_alt.clone()],
+                    pop_count: 0,
+                }
             };
             let level_ctx_id = stack_snapshot.last().map(|l| l.context);
             let post_set_stack = std::mem::replace(&mut self.stack, stack_snapshot.clone());
@@ -2137,7 +2158,10 @@ impl ParseState {
             // - the meta_content_scope of the current context is applied to the matched thing, unlike pop
             // - the clear_scopes are applied after the matched token, unlike push
             // - the interaction with meta scopes means that the token has the meta scopes of both the current scope and the new scope.
-            MatchOperation::Push(ref context_refs)
+            MatchOperation::Push {
+                ctx_refs: ref context_refs,
+                ..
+            }
             | MatchOperation::Set {
                 ctx_refs: ref context_refs,
                 ..
@@ -2147,6 +2171,17 @@ impl ParseState {
                     MatchOperation::Set { pop_count, .. } => pop_count.max(1),
                     _ => 1,
                 };
+                // `pop: N + push:` is **lookahead**: per ST docs, when pop is
+                // combined with push the pop happens first and the matched
+                // text is treated as a lookahead, so the popped frames'
+                // meta_scope atoms must be dropped from the visible stack
+                // before the trigger token records its scope. (`pop: N + set:`
+                // is the documented exception — stacking — handled below.)
+                let push_pop_count = match *match_op {
+                    MatchOperation::Push { pop_count, .. } => pop_count,
+                    _ => 0,
+                };
+                let is_push_with_pop = push_pop_count > 0;
                 // a match pattern that "set"s keeps the meta_content_scope and meta_scope from the previous context
                 if initial {
                     // v2: pop the USER-DECLARED part of cur.mcs so the
@@ -2200,49 +2235,39 @@ impl ParseState {
                             ops.push((index, ScopeStackOp::Pop(pop_count)));
                         }
                     }
-                    // `pop: N + set:` with N > 1 AND non-empty target
-                    // meta_scope: the (N-1) deeper popped contexts'
-                    // meta_scope / meta_content_scope atoms must be dropped
-                    // from the visible stack BEFORE the trigger token
-                    // records its scope. Without this, the trigger token
-                    // observes the leaked deeper meta_scope — observed on
-                    // Java's `@RunWith(JUnit4.class)` where
-                    // `pop: 2 + push: annotation-parameters-body` (becoming
-                    // `Set { pop_count: 2 }` per yaml_load) left
+                    // `pop: N + push:` with N > 1: per ST's lookahead rule,
+                    // the (N-1) deeper popped contexts' meta_scope /
+                    // meta_content_scope atoms must be dropped from the
+                    // visible stack BEFORE the trigger token records its
+                    // scope. Without this, the trigger token observes the
+                    // leaked deeper meta_scope — observed on Java's
+                    // `@RunWith(JUnit4.class)` where
+                    // `pop: 2 + push: annotation-parameters-body` left
                     // `meta.annotation.identifier.java`
                     // (annotation-unqualified-identifier's meta_scope) on
                     // the stack at the `(` token instead of just
                     // `meta.annotation.parameters.java meta.group.java`.
                     //
-                    // ST's quirk: when the target has NO meta_scope, ST
-                    // keeps the deeper popped context's meta_scope visible
-                    // to the matched text and pops it AFTER the match —
-                    // verified on TS's
+                    // `pop: N + set:` is the ST-documented exception
+                    // (stacking, not lookahead): the trigger token
+                    // RECEIVES the popped frames' meta_scope. That path is
+                    // handled in the non-initial phase below — both the
+                    // genuine stacking case (target has its own ms) and the
+                    // case where the target has no ms (e.g. TS's
                     // `(?:get|set|async){{identifier_break}} pop: 2 + set:`
                     // in `object-property-name`, where ST keeps
-                    // `meta.mapping.key.js` (object-literal-meta-key's
-                    // meta_scope) on the `get` token. Gating on a
-                    // non-empty target meta_scope keeps that path intact.
+                    // `meta.mapping.key.js` visible to the `get` token).
                     //
                     // Skip when cur or any popped deeper context has
                     // `clear_scopes`: those interact with the clear_stack
                     // through the existing non-initial pipeline (Restore
                     // ordering vs head_pop, multi-target Clear preview),
-                    // and the rotation here would race with that. Batch
-                    // File's `cmd-set-quoted-value-inner-end`
-                    // (`clear_scopes: 1` + `pop: 2 + set: ignored-tail-outer`)
-                    // is the canonical clear_scopes-having case the gate
-                    // protects.
-                    let target_has_ms = context_refs.iter().any(|r| {
-                        r.resolve(syntax_set)
-                            .map(|c| !c.meta_scope.is_empty())
-                            .unwrap_or(false)
-                    });
-                    let mut apply_initial_deeper_pop = is_set && set_pop_count > 1 && target_has_ms;
+                    // and the rotation here would race with that.
+                    let mut apply_initial_deeper_pop = is_push_with_pop && push_pop_count > 1;
                     apply_initial_deeper_pop &= cur_context.clear_scopes.is_none();
                     if apply_initial_deeper_pop {
                         let stack_len = self.stack.len();
-                        for depth in 1..set_pop_count.min(stack_len) {
+                        for depth in 1..push_pop_count.min(stack_len) {
                             let level_idx = stack_len - 1 - depth;
                             let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
                             if ctx.clear_scopes.is_some() {
@@ -2257,7 +2282,7 @@ impl ParseState {
                             ops.push((index, ScopeStackOp::Pop(cur_ms_rotate)));
                         }
                         let stack_len = self.stack.len();
-                        for depth in 1..set_pop_count.min(stack_len) {
+                        for depth in 1..push_pop_count.min(stack_len) {
                             let level_idx = stack_len - 1 - depth;
                             let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
                             if !ctx.meta_content_scope.is_empty() {
@@ -2557,9 +2582,10 @@ impl ParseState {
                             ops.push((index, ScopeStackOp::Restore));
                         }
 
-                        // `pop: N + set:` (set_pop_count > 1) unwinds N-1
-                        // deeper contexts in addition to the usual
-                        // set-replace semantics. Mirror the
+                        // `pop: N + set:` (set_pop_count > 1) is **stacking**
+                        // per ST docs: the trigger token receives the popped
+                        // frames' meta_scope, and the deeper-pop happens
+                        // AFTER the trigger records its scope. Mirror the
                         // `MatchOperation::Pop` arm: pop each deeper frame's
                         // mcs+ms in top-to-bottom order, then Restore that
                         // frame's `clear_scopes` if any. Without the
@@ -2573,40 +2599,11 @@ impl ParseState {
                         // clear_stack; the inner's `clear_scopes: 1` then
                         // cleared `source.regexp.python` instead.
                         //
-                        // Skip when the initial-phase deeper-pop already
-                        // ran (target has non-empty meta_scope, no
-                        // clear_scopes interactions): the deeper atoms are
-                        // already off the visible stack, and re-running
-                        // here would double-pop. The same condition is
-                        // computed in initial — keep them aligned. ST
-                        // keeps deeper popped atoms visible to the matched
-                        // token when the target has no meta_scope, so the
-                        // initial-phase pop is gated off and the deeper
-                        // pop must happen here (post-match) — observed on
-                        // TS's
-                        // `(?:get|set|async){{identifier_break}} pop: 2 +
-                        // set:` in `object-property-name`.
-                        let target_has_ms_ni = context_refs.iter().any(|r| {
-                            r.resolve(syntax_set)
-                                .map(|c| !c.meta_scope.is_empty())
-                                .unwrap_or(false)
-                        });
-                        let mut skip_ni_depth = is_set
-                            && set_pop_count > 1
-                            && target_has_ms_ni
-                            && cur_context.clear_scopes.is_none();
-                        if skip_ni_depth {
-                            let stack_len = self.stack.len();
-                            for depth in 1..set_pop_count.min(stack_len) {
-                                let level_idx = stack_len - 1 - depth;
-                                let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
-                                if ctx.clear_scopes.is_some() {
-                                    skip_ni_depth = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if is_set && set_pop_count > 1 && !skip_ni_depth {
+                        // Always emits for Set-with-pop. The Push-with-pop
+                        // (lookahead) path popped the deeper frames in the
+                        // initial phase already; it doesn't reach this arm
+                        // because `is_set` is false there.
+                        if is_set && set_pop_count > 1 {
                             let stack_len = self.stack.len();
                             for depth in 1..set_pop_count.min(stack_len) {
                                 let level_idx = stack_len - 1 - depth;
@@ -2748,16 +2745,27 @@ impl ParseState {
                 pop_count,
                 ..
             } => {
-                // When pop_count > 0 (pop + embed), use Set semantics to handle
+                // When pop_count > 0 (pop + embed), reuse the Set arm to handle
                 // popping the current context's meta scopes before pushing the
                 // embedded contexts' meta scopes.
+                //
+                // TODO: per ST's "pop happens first, match is lookahead" rule,
+                // `pop: N + embed:` is **lookahead** — the trigger should
+                // not inherit the popped frames' meta_scope. The synthetic
+                // `Set { pop_count }` here gives stacking semantics, the
+                // same conflation that `pop: N + push:` had before the IR
+                // split. See the analogous TODO at the synthetic-Branch
+                // construction site above.
                 let synthetic = if pop_count > 0 {
                     MatchOperation::Set {
                         ctx_refs: contexts.clone(),
                         pop_count,
                     }
                 } else {
-                    MatchOperation::Push(contexts.clone())
+                    MatchOperation::Push {
+                        ctx_refs: contexts.clone(),
+                        pop_count: 0,
+                    }
                 };
                 if pop_count > 0 {
                     // ST-observed divergence from plain `pop + set:`: on
@@ -2827,7 +2835,10 @@ impl ParseState {
                         pop_count,
                     }
                 } else {
-                    MatchOperation::Push(alternatives.clone())
+                    MatchOperation::Push {
+                        ctx_refs: alternatives.clone(),
+                        pop_count: 0,
+                    }
                 };
                 return self.push_meta_ops(
                     initial,
@@ -2852,7 +2863,32 @@ impl ParseState {
         syntax_set: &SyntaxSet,
     ) -> Result<bool, ParsingError> {
         let (ctx_refs, old_proto_ids, is_embed) = match pat.operation {
-            MatchOperation::Push(ref ctx_refs) => (ctx_refs, None, false),
+            MatchOperation::Push {
+                ref ctx_refs,
+                pop_count,
+            } => {
+                // `pop: N + push:` (pop_count > 0): pop N frames from the
+                // runtime stack before the push loop, mirroring Set's arm.
+                // The topmost popped frame's prototypes carry over so a
+                // `with_prototype` from the leaving context stays active on
+                // the new push (same convention as Set).
+                let old_proto_ids = if pop_count > 0 {
+                    let topmost = self.stack.pop().map(|s| s.prototypes);
+                    for _ in 1..pop_count {
+                        self.stack.pop();
+                    }
+                    topmost
+                } else {
+                    None
+                };
+                if pop_count > 0 {
+                    let final_len = self.stack.len() + ctx_refs.len();
+                    self.branch_points
+                        .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
+                    self.escape_stack.retain(|e| e.stack_depth < final_len);
+                }
+                (ctx_refs, old_proto_ids, false)
+            }
             MatchOperation::Embed {
                 ref contexts,
                 pop_count,
@@ -6906,12 +6942,107 @@ contexts:
     }
 
     #[test]
+    fn pop_n_set_with_stacked_meta_scopes_keeps_deeper_meta_scope_at_trigger() {
+        // `pop: N + set:` is the documented ST exception to the "pop is
+        // lookahead" rule — it is **stacking**: the trigger token receives
+        // BOTH the popped frames' meta_scope AND the target's meta_scope.
+        // Probe-witnessed against ST 4200 with the equivalent
+        // `PopFirstProbe.sublime-syntax` (input `[()]`, rule
+        // `pop: 2, set: target` on `)` with mid/inner/target each carrying
+        // meta_scope) — ST emits
+        // `source.X meta.mid meta.inner meta.target punctuation.close.paren`
+        // at the `)` trigger. See
+        // ~/.claude/.../project_syntect_st_divergences.md.
+        let syntax_str = r#"
+name: PopNSetStacked
+scope: source.popnsetstacked
+version: 2
+contexts:
+  main:
+    - match: 'a'
+      scope: p.a
+      push: mid
+
+  mid:
+    - meta_scope: meta.mid
+    - match: 'b'
+      scope: p.b
+      push: inner
+
+  inner:
+    - meta_scope: meta.inner
+    - match: 'c'
+      scope: p.c
+      pop: 2
+      set: target
+
+  target:
+    - meta_scope: meta.target
+    - match: 'd'
+      scope: p.d
+      pop: 1
+"#;
+        let syntax = SyntaxDefinition::load_from_str(syntax_str, true, None).unwrap();
+        let ss = link(syntax);
+        let mut state = ParseState::new(&ss.syntaxes()[0]);
+        let raw_ops = ops(&mut state, "abcd", &ss);
+        let states = stack_states(raw_ops);
+
+        let c_state = states
+            .iter()
+            .find(|s| s.contains("p.c"))
+            .unwrap_or_else(|| panic!("expected a state containing `p.c`, got: {:?}", states));
+        // ST stacking: the trigger token receives the popped frames'
+        // meta_scope (mid + inner) AND the pushed target's meta_scope.
+        assert!(
+            c_state.contains("meta.mid"),
+            "meta.mid (deeper popped frame's meta_scope) must remain visible \
+             at the `c` trigger of `pop: 2 + set:` (ST stacking semantics): {}",
+            c_state
+        );
+        assert!(
+            c_state.contains("meta.inner"),
+            "meta.inner (cur context's meta_scope) must remain visible at \
+             the `c` trigger of `pop: 2 + set:`: {}",
+            c_state
+        );
+        assert!(
+            c_state.contains("meta.target"),
+            "meta.target (pushed target's meta_scope) must be visible at \
+             the `c` trigger of `pop: 2 + set:`: {}",
+            c_state
+        );
+
+        // After the trigger, the stack must collapse to main + target so
+        // subsequent body tokens see only `meta.target`.
+        let d_state = states
+            .iter()
+            .find(|s| s.contains("p.d"))
+            .unwrap_or_else(|| panic!("expected a state containing `p.d`, got: {:?}", states));
+        assert!(
+            !d_state.contains("meta.mid") && !d_state.contains("meta.inner"),
+            "popped frames' meta_scope must not linger past the trigger: {}",
+            d_state
+        );
+        assert!(
+            d_state.contains("meta.target"),
+            "meta.target must remain on the stack for subsequent tokens: {}",
+            d_state
+        );
+    }
+
+    #[test]
     fn pop_n_set_without_deeper_clear_scopes_unaffected() {
         // Same shape as the test above but with no `clear_scopes` on the
         // deeper popped frame. Verifies the head-pop split doesn't change
         // behavior when the per-depth Restore would be a no-op — defends
-        // against regression of Java's `pop:2 + push: annotation-parameters-body`
-        // and similar shapes where deeper frames have no clears.
+        // against regression of TS's
+        // `(?:get|set|async){{identifier_break}} pop: 2 + set:` in
+        // `object-property-name` and similar genuine `pop:N + set:` shapes
+        // where deeper frames have no clears. (Java's
+        // `pop: 2 + push: annotation-parameters-body` was previously cited
+        // here but now parses as `Push { pop_count: 2 }` and exercises a
+        // distinct lookahead path.)
         let syntax_str = r#"
 name: PopNSetNoDeeperClear
 scope: source.popnsetnodeepclear
@@ -8423,16 +8554,16 @@ contexts:
 
     #[cfg(feature = "default-onig")]
     #[test]
-    fn pop_n_set_with_target_meta_scope_pops_deeper_meta_scope_at_trigger() {
+    fn pop_n_push_with_target_meta_scope_drops_deeper_meta_scope_at_trigger() {
         // Java's `@RunWith(JUnit4.class)` inside a class block:
         // `annotation-unqualified-parameters`'s
-        // `match: \( pop: 2 push: annotation-parameters-body` (becoming
-        // `Set { pop_count: 2, ctx_refs: [annotation-parameters-body] }`
-        // per yaml_load) leaked
+        // `match: \( pop: 2 push: annotation-parameters-body` becomes
+        // `Push { pop_count: 2, ctx_refs: [annotation-parameters-body] }`
+        // per yaml_load. ST treats `pop:N + push:` as **lookahead** — the
+        // popped frames' meta_scope atoms are dropped from the visible
+        // stack before the trigger token records its scope. Without this,
         // `annotation-unqualified-identifier`'s `meta.annotation.identifier.java`
-        // onto the `(` trigger token. ST drops the deeper popped context's
-        // meta_scope before the trigger sees its scope when the target
-        // declares its own meta_scope.
+        // (the deeper popped frame's meta_scope) leaks onto the `(` trigger.
         use crate::parsing::SyntaxSet;
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let syntax = ss

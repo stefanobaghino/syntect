@@ -393,16 +393,18 @@ impl SyntaxDefinition {
                     pop_count: y as usize,
                 }
             } else if let Ok(p) = get_key(map, "push", Some) {
-                // `pop: N + push: X` pops N contexts then pushes X —
-                // equivalent stack effect to `pop: N + set: X`. Without
-                // this case the `push` was silently dropped and the rule
-                // degraded to a plain `Pop(N)`, leaving the parser on the
-                // outer context instead of the intended target.
+                // `pop: N + push: X` pops N contexts then pushes X. ST docs:
+                // when `pop` is combined with another action, the pop happens
+                // first and the matched text is treated as a lookahead — so
+                // the trigger token does NOT inherit the popped frames'
+                // meta_scope atoms. This is distinct from `pop: N + set:`,
+                // which is the documented exception (stacking).
+                //
                 // Observed on Java's `pop: 2 + push: annotation-parameters-body`
                 // (annotation arg lists) and `pop: 1 + push: case-label-expression`,
                 // and on Python's `pop: 2 + push: function-parameter-list-body`
                 // / `type-parameter-list-body`.
-                MatchOperation::Set {
+                MatchOperation::Push {
                     ctx_refs: SyntaxDefinition::parse_pushargs(p, state, contexts, namer)?,
                     pop_count: y as usize,
                 }
@@ -410,7 +412,10 @@ impl SyntaxDefinition {
                 MatchOperation::Pop(y as usize)
             }
         } else if let Ok(y) = get_key(map, "push", Some) {
-            MatchOperation::Push(SyntaxDefinition::parse_pushargs(y, state, contexts, namer)?)
+            MatchOperation::Push {
+                ctx_refs: SyntaxDefinition::parse_pushargs(y, state, contexts, namer)?,
+                pop_count: 0,
+            }
         } else if let Ok(y) = get_key(map, "set", Some) {
             MatchOperation::Set {
                 ctx_refs: SyntaxDefinition::parse_pushargs(y, state, contexts, namer)?,
@@ -1160,19 +1165,22 @@ mod tests {
                 use crate::parsing::syntax_definition::ContextReference::*;
 
                 // this is sadly necessary because Context is not Eq because of the Regex
-                let expected = MatchOperation::Push(vec![
-                    Named("string".to_owned()),
-                    ByScope {
-                        scope: Scope::new("source.c").unwrap(),
-                        sub_context: Some("main".to_owned()),
-                        with_escape: false,
-                    },
-                    File {
-                        name: "CSS".to_owned(),
-                        sub_context: Some("rule-list-body".to_owned()),
-                        with_escape: false,
-                    },
-                ]);
+                let expected = MatchOperation::Push {
+                    ctx_refs: vec![
+                        Named("string".to_owned()),
+                        ByScope {
+                            scope: Scope::new("source.c").unwrap(),
+                            sub_context: Some("main".to_owned()),
+                            with_escape: false,
+                        },
+                        File {
+                            name: "CSS".to_owned(),
+                            sub_context: Some("rule-list-body".to_owned()),
+                            with_escape: false,
+                        },
+                    ],
+                    pop_count: 0,
+                };
                 assert_eq!(
                     format!("{:?}", match_pat.operation),
                     format!("{:?}", expected)
@@ -1336,11 +1344,19 @@ mod tests {
     }
 
     #[test]
-    fn pop_plus_push_becomes_set_with_pop_count() {
-        // Regression: Java's `pop: 2 + push: annotation-parameters-body`
-        // (and Python's `pop: 2 + push: function-parameter-list-body` etc.)
-        // were silently dropping the `push` half and degrading to a plain
-        // `Pop(N)`, so the target context never appeared on the stack.
+    fn pop_plus_push_becomes_push_with_pop_count() {
+        // `pop: N + push: X` is **lookahead** per ST docs ("when pop is
+        // combined with another action, the pop happens first and the match
+        // is treated as a lookahead"), distinct from `pop: N + set:` which
+        // ST documents as the stacking exception. yaml_load preserves that
+        // distinction by routing `pop:N + push:` to `Push { pop_count: N }`
+        // and `pop:N + set:` to `Set { pop_count: N }`. See
+        // `pop_plus_set_keeps_set_with_pop_count` for the sibling case.
+        //
+        // Real-world callers: Java's `pop: 2 + push: annotation-parameters-body`
+        // (annotation arg lists), `pop: 1 + push: case-label-expression`;
+        // Python's `pop: 2 + push: function-parameter-list-body` and
+        // `type-parameter-list-body`.
         let def = SyntaxDefinition::load_from_str(
             r#"
         name: Test
@@ -1363,7 +1379,7 @@ mod tests {
         let ctx = &def.contexts["main"];
         if let Pattern::Match(ref match_pattern) = ctx.patterns[0] {
             match match_pattern.operation {
-                MatchOperation::Set {
+                MatchOperation::Push {
                     ref ctx_refs,
                     pop_count,
                 } => {
@@ -1375,7 +1391,7 @@ mod tests {
                     ));
                 }
                 _ => panic!(
-                    "Expected Set operation with pop_count=2, got {:?}",
+                    "Expected Push operation with pop_count=2, got {:?}",
                     match_pattern.operation
                 ),
             }

@@ -314,66 +314,6 @@ fn build_capture_ops(capture_map: &CaptureMapping, regions: &Region) -> Vec<(usi
     map.into_iter().map(|((i, _), op)| (i, op)).collect()
 }
 
-/// Number of leading atoms in `pat_scope` that ST collapses against
-/// the popped contexts' `meta_scope` atoms. Only fires when the
-/// action is a `Set` whose `pop_count` actually pops contexts whose
-/// `meta_scope` matches `pat_scope`'s leading atoms — i.e. the rule
-/// re-states the popped frames' meta_scope on the matched text. ST
-/// collapses these adjacent duplicates rather than re-pushing them.
-///
-/// Reproduces ST's collapse on Java's
-/// `annotation-qualified-identifier-name` (whose `scope:` re-states
-/// the popped `annotation-qualified-identifier`'s `meta_scope` while
-/// `pop: 2 + branch:` unwinds it) — observed as doubled
-/// `meta.annotation.identifier.java meta.path.java` on
-/// `@ClassName.FixMethodOrder(...)`.
-///
-/// The leading-atom match against popped meta_scopes is the gate that
-/// keeps CSS `selector(.bar)` inside `@import supports(...)` from
-/// collapsing the inner `meta.function-call.arguments.css meta.group.css`
-/// level: there the action `set:` pops a frame with empty
-/// `meta_scope`, the rule's leading atoms come from the *outer*
-/// (non-popped) `meta_content_scope`, no popped-ms match, no collapse.
-fn pat_scope_skip_count(
-    pat_scope: &[Scope],
-    match_op: &MatchOperation,
-    stack: &[StateLevel],
-    syntax_set: &SyntaxSet,
-) -> Result<usize, ParsingError> {
-    if pat_scope.is_empty() {
-        return Ok(0);
-    }
-    let pop_count = match match_op {
-        MatchOperation::Set { pop_count, .. } => *pop_count,
-        _ => return Ok(0),
-    };
-    if pop_count == 0 {
-        return Ok(0);
-    }
-    let stack_len = stack.len();
-    let pops = pop_count.min(stack_len);
-    let mut popped_ms: Vec<Scope> = Vec::new();
-    // Bottom-to-top: deepest popped frame first, so the `pat_scope`'s
-    // leftmost (deeper) atom aligns with the deepest popped ms atom.
-    for depth in (0..pops).rev() {
-        let level = &stack[stack_len - 1 - depth];
-        let ctx = syntax_set.get_context(&level.context)?;
-        popped_ms.extend(ctx.meta_scope.iter().copied());
-    }
-    if popped_ms.is_empty() {
-        return Ok(0);
-    }
-    let max = pat_scope.len().min(popped_ms.len());
-    let mut k = max;
-    while k > 0 {
-        if pat_scope[..k] == popped_ms[popped_ms.len() - k..] {
-            return Ok(k);
-        }
-        k -= 1;
-    }
-    Ok(0)
-}
-
 // To understand the implementation of this, here's an introduction to how
 // Sublime Text syntax definitions work.
 //
@@ -1218,30 +1158,15 @@ impl ParseState {
                         .unwrap_or_default(),
                 };
                 self.branch_points.push(bp);
-                // When pop_count > 0 (pop + branch), reuse the Set arm to
-                // pop the current context before pushing the first alternative.
-                //
-                // TODO: per ST's "pop happens first, match is lookahead" rule,
-                // `pop: N + branch:` should be **lookahead** — the trigger
-                // token must NOT inherit the popped frames' meta_scope. The
-                // synthetic `Set { pop_count }` here gives stacking
-                // semantics instead, mirroring the historical conflation
-                // that `pop: N + push:` had before the IR split. The fix
-                // follows the same pattern: extend `Branch.alternatives`
-                // dispatch to the lookahead path. Tracked separately. The
-                // analogous comment at the `Embed` synthetic site below and
-                // at the safety-fallback synthetic-Branch arm in
-                // `push_meta_ops` applies.
-                synthetic_op = if pop_count > 0 {
-                    MatchOperation::Set {
-                        ctx_refs: vec![alternatives[0].clone()],
-                        pop_count,
-                    }
-                } else {
-                    MatchOperation::Push {
-                        ctx_refs: vec![alternatives[0].clone()],
-                        pop_count: 0,
-                    }
+                // `pop: N + branch:` is **lookahead** per ST: the trigger
+                // token must NOT inherit the popped frames' meta_scope.
+                // Route through `Push { pop_count }` so the existing
+                // Push-with-pop lookahead path in `push_meta_ops` /
+                // `perform_op` handles both the deeper-pop emission and
+                // the runtime stack mutation.
+                synthetic_op = MatchOperation::Push {
+                    ctx_refs: vec![alternatives[0].clone()],
+                    pop_count,
                 };
             } else {
                 unreachable!()
@@ -1257,19 +1182,7 @@ impl ParseState {
         };
 
         self.push_meta_ops(true, match_start, level_context, op_to_use, syntax_set, ops)?;
-        // ST collapses adjacent duplicate scope atoms: when a rule's
-        // `scope:` leads with atoms identical to the top of the visible
-        // stack at match_start (typically the parent context's
-        // `meta_scope` contributing those atoms), only the
-        // non-overlapping suffix is pushed onto the matched text. Without
-        // this, qualified-annotation rules whose scope explicitly
-        // re-states the parent's meta_scope produce doubled atoms — e.g.
-        // `meta.annotation.identifier.java meta.path.java` appearing
-        // twice on `@ClassName.FixMethodOrder(...)` in Java's
-        // `annotation-qualified-identifier-name` (whose `scope:`
-        // re-states `annotation-qualified-identifier`'s `meta_scope`).
-        let scope_skip = pat_scope_skip_count(&pat.scope, op_to_use, &self.stack, syntax_set)?;
-        for s in &pat.scope[scope_skip..] {
+        for s in &pat.scope {
             ops.push((match_start, ScopeStackOp::Push(*s)));
         }
         let capture_ops = pat
@@ -1278,8 +1191,8 @@ impl ParseState {
             .map(|m| build_capture_ops(m, &reg_match.regions))
             .unwrap_or_default();
         ops.extend(capture_ops.iter().cloned());
-        if pat.scope.len() > scope_skip {
-            ops.push((match_end, ScopeStackOp::Pop(pat.scope.len() - scope_skip)));
+        if !pat.scope.is_empty() {
+            ops.push((match_end, ScopeStackOp::Pop(pat.scope.len())));
         }
         self.push_meta_ops(false, match_end, level_context, op_to_use, syntax_set, ops)?;
 
@@ -1790,16 +1703,9 @@ impl ParseState {
             // calls — `self.stack` currently holds the post-set state
             // (alt N already pushed).
             let mut first_line_prefix = prefix_ops.clone();
-            let synthetic_op_alt_n = if pop_count > 0 {
-                MatchOperation::Set {
-                    ctx_refs: vec![next_alt.clone()],
-                    pop_count,
-                }
-            } else {
-                MatchOperation::Push {
-                    ctx_refs: vec![next_alt.clone()],
-                    pop_count: 0,
-                }
+            let synthetic_op_alt_n = MatchOperation::Push {
+                ctx_refs: vec![next_alt.clone()],
+                pop_count,
             };
             let level_ctx_id = stack_snapshot.last().map(|l| l.context);
             let post_set_stack = std::mem::replace(&mut self.stack, stack_snapshot.clone());
@@ -1987,16 +1893,9 @@ impl ParseState {
             // (pre-pop state captured at branch creation) for the
             // duration of the calls — `self.stack` currently holds the
             // post-set state (alt N already pushed).
-            let synthetic_op_alt_n = if pop_count > 0 {
-                MatchOperation::Set {
-                    ctx_refs: vec![next_alt.clone()],
-                    pop_count,
-                }
-            } else {
-                MatchOperation::Push {
-                    ctx_refs: vec![next_alt.clone()],
-                    pop_count: 0,
-                }
+            let synthetic_op_alt_n = MatchOperation::Push {
+                ctx_refs: vec![next_alt.clone()],
+                pop_count,
             };
             let level_ctx_id = stack_snapshot.last().map(|l| l.context);
             let post_set_stack = std::mem::replace(&mut self.stack, stack_snapshot.clone());
@@ -2750,12 +2649,15 @@ impl ParseState {
                 // embedded contexts' meta scopes.
                 //
                 // TODO: per ST's "pop happens first, match is lookahead" rule,
-                // `pop: N + embed:` is **lookahead** — the trigger should
-                // not inherit the popped frames' meta_scope. The synthetic
-                // `Set { pop_count }` here gives stacking semantics, the
-                // same conflation that `pop: N + push:` had before the IR
-                // split. See the analogous TODO at the synthetic-Branch
-                // construction site above.
+                // `pop: N + embed:` is **lookahead** — the trigger should not
+                // inherit the popped frames' meta_scope. The synthetic
+                // `Set { pop_count }` here gives stacking semantics. The
+                // analogous Branch case has been routed through Push-with-pop
+                // lookahead; Embed follows the same pattern but interacts with
+                // the cur_context meta_scope suppression below
+                // (parser.rs:2796-2806) and the
+                // `v2_pop_embed_suppresses_cur_meta_scope_on_match` quirk, so
+                // it is left for a follow-up.
                 let synthetic = if pop_count > 0 {
                     MatchOperation::Set {
                         ctx_refs: contexts.clone(),
@@ -2826,19 +2728,13 @@ impl ParseState {
                 pop_count,
                 ..
             } => {
-                // Branch acts like Push for meta ops purposes (or Set when pop_count > 0).
-                // At exec time, Branch is transformed into a synthetic Push/Set before
-                // calling push_meta_ops, so this arm is a safety fallback.
-                let synthetic = if pop_count > 0 {
-                    MatchOperation::Set {
-                        ctx_refs: alternatives.clone(),
-                        pop_count,
-                    }
-                } else {
-                    MatchOperation::Push {
-                        ctx_refs: alternatives.clone(),
-                        pop_count: 0,
-                    }
+                // Branch acts like Push for meta ops purposes — `pop:N + branch:`
+                // is lookahead per ST, same as `pop:N + push:`. At exec time,
+                // Branch is transformed into a synthetic Push before calling
+                // push_meta_ops, so this arm is a safety fallback.
+                let synthetic = MatchOperation::Push {
+                    ctx_refs: alternatives.clone(),
+                    pop_count,
                 };
                 return self.push_meta_ops(
                     initial,
@@ -7032,6 +6928,80 @@ contexts:
     }
 
     #[test]
+    fn pop_n_set_with_leading_atom_keeps_duplicate_at_trigger() {
+        // ST stacking for `pop:N + set:` keeps the popped frames'
+        // `meta_scope` AND the rule's `scope:` even when the rule's
+        // leading atom is identical to the popped frame's `meta_scope`.
+        // Probe-witnessed against ST 4200 (SetDedupProbe): outer with
+        // `meta_scope: meta.outer`, rule
+        // `match: ';' scope: meta.outer punctuation.semi set: target`.
+        // ST emits `source.X meta.outer meta.target meta.outer
+        // punctuation.semi` at the `;` trigger — `meta.outer` appears
+        // twice. Pre-fix syntect collapsed the duplicate via
+        // `pat_scope_skip_count`. See
+        // `~/.claude/.../project_syntect_st_divergences.md`.
+        let syntax_str = r#"
+name: SetDedupProbe
+scope: source.setdedupprobe
+version: 2
+contexts:
+  main:
+    - match: 'a'
+      scope: p.a
+      push: outer
+
+  outer:
+    - meta_scope: meta.outer
+    - match: ';'
+      scope: meta.outer punctuation.semi
+      set: target
+
+  target:
+    - meta_scope: meta.target
+    - match: 'd'
+      scope: p.d
+      pop: 1
+"#;
+        let syntax = SyntaxDefinition::load_from_str(syntax_str, true, None).unwrap();
+        let ss = link(syntax);
+        let mut state = ParseState::new(&ss.syntaxes()[0]);
+        let raw_ops = ops(&mut state, "a;d", &ss);
+        let states = stack_states(raw_ops);
+
+        let semi_state = states
+            .iter()
+            .find(|s| s.contains("punctuation.semi"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a state containing `punctuation.semi`, got: {:?}",
+                    states
+                )
+            });
+        // ST stacking with leading-atom duplicate: meta.outer appears
+        // twice (once from popped meta_scope, once from rule scope).
+        let outer_count = semi_state.matches("meta.outer").count();
+        assert_eq!(
+            outer_count, 2,
+            "meta.outer must appear twice on the `;` trigger of \
+             `pop: 1 + set:` whose rule scope leads with the popped \
+             frame's meta_scope (ST stacking — no leading-atom collapse): {}",
+            semi_state
+        );
+        assert!(
+            semi_state.contains("meta.target"),
+            "meta.target (pushed target's meta_scope) must be visible \
+             at the `;` trigger: {}",
+            semi_state
+        );
+        assert!(
+            semi_state.contains("punctuation.semi"),
+            "punctuation.semi (rule's last scope atom) must be visible \
+             at the `;` trigger: {}",
+            semi_state
+        );
+    }
+
+    #[test]
     fn pop_n_set_without_deeper_clear_scopes_unaffected() {
         // Same shape as the test above but with no `clear_scopes` on the
         // deeper popped frame. Verifies the head-pop split doesn't change
@@ -8909,12 +8879,12 @@ contexts:
     /// `annotation-qualified-identifier-name` rule's `scope:`
     /// re-states the popped `annotation-qualified-identifier`'s
     /// `meta_scope` atoms while `pop: 2 + branch:` unwinds them.
-    /// Without `pat_scope_skip_count`, the matched text retains both
-    /// the popped frames' meta_scope atoms AND the rule scope's
-    /// re-statement, producing a stack like
-    /// `... meta.annotation.identifier.java meta.path.java
-    /// meta.annotation.identifier.java meta.path.java
-    /// variable.annotation.java`. ST collapses the duplicate.
+    /// Defended by Branch+pop's lookahead semantics — `pop:N + branch:`
+    /// is dispatched as `Push { pop_count }`, so the trigger token
+    /// excludes the popped frames' `meta_scope` per ST and the rule's
+    /// re-stated atoms appear exactly once. Pre-fix this same shape
+    /// was suppressed by `pat_scope_skip_count` masking a stacking
+    /// synthesis (`Set { pop_count }`).
     #[cfg(feature = "default-onig")]
     #[test]
     fn qualified_annotation_does_not_double_identifier_path_atoms() {

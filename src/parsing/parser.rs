@@ -2644,30 +2644,17 @@ impl ParseState {
                 pop_count,
                 ..
             } => {
-                // When pop_count > 0 (pop + embed), reuse the Set arm to handle
-                // popping the current context's meta scopes before pushing the
-                // embedded contexts' meta scopes.
-                //
-                // TODO: per ST's "pop happens first, match is lookahead" rule,
-                // `pop: N + embed:` is **lookahead** — the trigger should not
-                // inherit the popped frames' meta_scope. The synthetic
-                // `Set { pop_count }` here gives stacking semantics. The
-                // analogous Branch case has been routed through Push-with-pop
-                // lookahead; Embed follows the same pattern but interacts with
-                // the cur_context meta_scope suppression below
-                // (parser.rs:2796-2806) and the
-                // `v2_pop_embed_suppresses_cur_meta_scope_on_match` quirk, so
-                // it is left for a follow-up.
-                let synthetic = if pop_count > 0 {
-                    MatchOperation::Set {
-                        ctx_refs: contexts.clone(),
-                        pop_count,
-                    }
-                } else {
-                    MatchOperation::Push {
-                        ctx_refs: contexts.clone(),
-                        pop_count: 0,
-                    }
+                // `pop: N + embed:` is **lookahead** per ST: the trigger
+                // token must NOT inherit the popped frames' meta_scope.
+                // Route through `Push { pop_count }` so the existing
+                // Push-with-pop lookahead path in `push_meta_ops` /
+                // `perform_op` handles deeper-pop emission. The
+                // pre-recursive Pops below cover the embed-specific
+                // cur_context meta_scope suppression (depth 0); the
+                // Push-with-pop deeper-pop loop covers depths 1..N.
+                let synthetic = MatchOperation::Push {
+                    ctx_refs: contexts.clone(),
+                    pop_count,
                 };
                 if pop_count > 0 {
                     // ST-observed divergence from plain `pop + set:`: on
@@ -8161,6 +8148,115 @@ contexts:
                 .unwrap_or(false),
             "stack top on `>` must be `end.scope`, got: {:?}",
             at_gt
+        );
+    }
+
+    #[test]
+    fn pop_n_embed_drops_deeper_meta_scope_at_trigger() {
+        // `pop: N + embed:` is **lookahead** per ST docs: "for `push`,
+        // `embed` and `branch` actions, the pop treats the match as if
+        // it were a lookahead." With stack `main -> mid -> inner` (each
+        // with non-empty meta_scope), a `pop: 2 + embed:` rule's trigger
+        // token must NOT carry `meta.mid` or `meta.inner` — both popped
+        // frames' meta_scope are excluded.
+        //
+        // Companion to `v2_pop_embed_suppresses_cur_meta_scope_on_match`
+        // (which covers single-pop cur suppression) and to bug-#1's
+        // `pop_n_push_with_target_meta_scope_drops_deeper_meta_scope_at_trigger`
+        // (the analogous Push case). Push, Branch and Embed share the
+        // same lookahead semantics.
+        let host = SyntaxDefinition::load_from_str(
+            r#"
+name: PopEmbedDeep
+scope: source.popembeddeep
+file_extensions: [popembeddeep]
+version: 2
+contexts:
+  main:
+    - match: 'a'
+      scope: p.a
+      push: mid
+
+  mid:
+    - meta_scope: meta.mid
+    - match: 'b'
+      scope: p.b
+      push: inner
+
+  inner:
+    - meta_include_prototype: false
+    - meta_scope: meta.inner
+    - match: 'c'
+      scope: p.c
+      pop: 2
+      embed: scope:source.popembeddeepguest
+      escape: '(?=$)'
+"#,
+            true,
+            None,
+        )
+        .unwrap();
+        let guest = SyntaxDefinition::load_from_str(
+            r#"
+name: PopEmbedDeepGuest
+scope: source.popembeddeepguest
+hidden: true
+version: 2
+contexts:
+  main:
+    - meta_scope: meta.guest
+    - match: '\w+'
+      scope: word.guest
+"#,
+            true,
+            None,
+        )
+        .unwrap();
+
+        let mut builder = SyntaxSetBuilder::new();
+        builder.add(host);
+        builder.add(guest);
+        let ss = builder.build();
+        let syntax = ss.find_syntax_by_name("PopEmbedDeep").unwrap();
+        let mut state = ParseState::new(syntax);
+        let line = "abc\n";
+        let ops = state.parse_line(line, &ss).unwrap().ops;
+
+        use crate::easy::ScopeRangeIterator;
+        let mut stack = ScopeStack::new();
+        let mut at_c: Option<Vec<String>> = None;
+        for (range, op) in ScopeRangeIterator::new(&ops, line) {
+            stack.apply(op).expect("op stream must apply cleanly");
+            if range.start <= 2 && 2 < range.end {
+                at_c = Some(
+                    stack
+                        .as_slice()
+                        .iter()
+                        .map(|s| format!("{:?}", s))
+                        .collect(),
+                );
+            }
+        }
+        let at_c = at_c.expect("range covering `c` must exist in op stream");
+        assert!(
+            !at_c.iter().any(|s| s.contains("meta.mid")),
+            "deeper popped frame's meta_scope (meta.mid) must be \
+             excluded from the `c` trigger of `pop: 2 + embed:` (ST \
+             lookahead semantics): {:?}",
+            at_c
+        );
+        assert!(
+            !at_c.iter().any(|s| s.contains("meta.inner")),
+            "cur context's meta_scope (meta.inner) must be excluded \
+             from the `c` trigger of `pop: 2 + embed:` (ST embed \
+             quirk + lookahead): {:?}",
+            at_c
+        );
+        assert!(
+            at_c.iter().any(|s| s.contains("p.c")),
+            "rule's explicit scope (p.c) must be present at the `c` \
+             trigger: {:?}",
+            at_c
         );
     }
 

@@ -267,7 +267,7 @@ struct BranchPoint {
     ops_snapshot_len: usize,
     /// Stack depth at creation — if stack shrinks below this, branch is invalid.
     stack_depth: usize,
-    non_consuming_push_at_snapshot: (usize, usize),
+    non_consuming_push_at_snapshot: (usize, usize, usize),
     first_line_snapshot: bool,
     with_prototype: Option<ContextReference>,
     /// `pending_lines.len()` at snapshot time, for cross-line replay truncation.
@@ -648,7 +648,7 @@ impl ParseState {
         let fnv = BuildHasherDefault::<FnvHasher>::default();
         let mut search_cache: SearchCache = HashMap::with_capacity_and_hasher(128, fnv);
         // Used for detecting loops with push/pop, see long comment above.
-        let mut non_consuming_push_at = (0, 0);
+        let mut non_consuming_push_at = (0, 0, 0);
 
         while self.parse_next_token(
             line,
@@ -671,12 +671,13 @@ impl ParseState {
         start: &mut usize,
         search_cache: &mut SearchCache,
         regions: &mut Region,
-        non_consuming_push_at: &mut (usize, usize),
+        non_consuming_push_at: &mut (usize, usize, usize),
         ops: &mut Vec<(usize, ScopeStackOp)>,
     ) -> Result<bool, ParsingError> {
-        let check_pop_loop = {
-            let (pos, stack_depth) = *non_consuming_push_at;
-            pos == *start && stack_depth == self.stack.len()
+        let (check_pop_loop, pre_push_depth) = {
+            let (pos, pre, post) = *non_consuming_push_at;
+            let armed = pos == *start && pre < self.stack.len() && self.stack.len() <= post;
+            (armed, pre)
         };
 
         // Trim proto_starts that are no longer valid
@@ -696,6 +697,7 @@ impl ParseState {
             search_cache,
             regions,
             check_pop_loop,
+            pre_push_depth,
         )?;
 
         if let Some(reg_match) = best_match {
@@ -764,16 +766,24 @@ impl ParseState {
             let consuming = match_end > *start;
             if !consuming {
                 // The match doesn't consume any characters. If this is a
-                // "push", remember the position and stack size so that we can
-                // check the next "pop" for loops. Otherwise leave the state,
-                // e.g. non-consuming "set" could also result in a loop.
-                if matches!(
-                    match_pattern.operation,
-                    MatchOperation::Push { .. }
-                        | MatchOperation::Branch { .. }
-                        | MatchOperation::Embed { .. }
-                ) {
-                    *non_consuming_push_at = (match_end, self.stack.len() + 1);
+                // "push", remember the position and the post-push stack depth
+                // interval so that we can check the next "pop" for loops.
+                // Otherwise leave the state, e.g. non-consuming "set" could
+                // also result in a loop.
+                //
+                // The interval [pre+1, pre+K] covers every depth the unwind
+                // can pass through; for K=1 it collapses to the original
+                // armed depth pre+1, preserving the prior single-push guard.
+                let k = match &match_pattern.operation {
+                    MatchOperation::Push { ctx_refs, .. } => ctx_refs.len(),
+                    MatchOperation::Branch { .. } => 1,
+                    MatchOperation::Embed { contexts, .. } => contexts.len(),
+                    _ => 0,
+                };
+                if k > 0 {
+                    let pre = self.stack.len();
+                    let post = pre + k;
+                    *non_consuming_push_at = (match_end, pre, post);
                 }
                 // Inside a cross-line replay, a non-consuming `Branch` whose
                 // match lands past every character of the replay line creates
@@ -850,6 +860,7 @@ impl ParseState {
         search_cache: &mut SearchCache,
         regions: &mut Region,
         check_pop_loop: bool,
+        pre_push_depth: usize,
     ) -> Result<Option<RegexMatch<'a>>, ParsingError> {
         let cur_level = &self.stack[self.stack.len() - 1];
         let context = syntax_set.get_context(&cur_level.context)?;
@@ -958,16 +969,23 @@ impl ParseState {
 
                         let consuming = match_end > start;
                         // A non-consuming `pop: N` after a non-consuming push
-                        // only loops when N == 1 — that restores the exact
-                        // pre-push stack, so the push rule fires again. With
-                        // N >= 2 the stack drops strictly below the pre-push
-                        // depth, so the outer context no longer has the same
-                        // trigger in scope (e.g. Haskell's `immediately-pop2`
-                        // as the fallback branch alternative for
-                        // `declaration-type-end`).
+                        // loops iff its post-pop depth equals the trigger
+                        // depth — strict equality. Dropping *below*
+                        // pre_push_depth leaves the trigger context entirely
+                        // (e.g. Haskell's `immediately-pop2` as the fallback
+                        // branch alternative for `declaration-type-end`).
+                        // Generalises the prior `Pop(1)` narrowing (which
+                        // matched K=1) to multi-context pushes where the loop
+                        // closes via a multi-level pop chain (e.g. `pop:1`
+                        // then `pop:2` against `push:[a,b,c]`).
                         pop_would_loop = check_pop_loop
                             && !consuming
-                            && matches!(match_pat.operation, MatchOperation::Pop(1));
+                            && match &match_pat.operation {
+                                MatchOperation::Pop(n) => {
+                                    self.stack.len().saturating_sub(*n) == pre_push_depth
+                                }
+                                _ => false,
+                            };
 
                         let push_too_deep = matches!(
                             match_pat.operation,
@@ -1104,7 +1122,7 @@ impl ParseState {
         level_context: &'a Context,
         syntax_set: &'a SyntaxSet,
         start: &mut usize,
-        non_consuming_push_at: &mut (usize, usize),
+        non_consuming_push_at: &mut (usize, usize, usize),
         ops: &mut Vec<(usize, ScopeStackOp)>,
         search_cache: &mut SearchCache,
     ) -> Result<bool, ParsingError> {
@@ -1768,7 +1786,7 @@ impl ParseState {
         name: &str,
         line: &str,
         start: &mut usize,
-        non_consuming_push_at: &mut (usize, usize),
+        non_consuming_push_at: &mut (usize, usize, usize),
         ops: &mut Vec<(usize, ScopeStackOp)>,
         search_cache: &mut SearchCache,
         syntax_set: &SyntaxSet,
@@ -1979,7 +1997,7 @@ impl ParseState {
                 // restored state.
                 ops.clear();
                 *start = 0;
-                *non_consuming_push_at = (0, 0);
+                *non_consuming_push_at = (0, 0, 0);
                 search_cache.clear();
                 return Ok(true);
             }
@@ -2408,7 +2426,7 @@ impl ParseState {
             // Restart the current line from the beginning.
             ops.clear();
             *start = 0;
-            *non_consuming_push_at = (0, 0);
+            *non_consuming_push_at = (0, 0, 0);
 
             // Guard: the replayed `parse_line_inner` calls above can
             // mutate `self.branch_points` (adding new branches,
@@ -4280,6 +4298,40 @@ contexts:
         // and `y` stayed inside the wrapper and never matched
         // `test.main.y`.
         expect_scope_stacks("openyz", &["<source.test>, <test.main.y>"], syntax);
+    }
+
+    #[test]
+    fn non_consuming_multi_push_with_skip_unwind_does_not_loop() {
+        // Pre-fix: parser hangs — K=3 push stored armed depth D+1, but
+        // a multi-level pop chain (`pop:1` then `pop:2`) unwinds
+        // D+3 → D+2 → D, never visiting D+1, so the loop guard never
+        // arms and `parse_line_inner_from` re-enters main's empty
+        // push forever. Under the fix the guard arms across the
+        // half-open interval (D, D+K] and fires when a non-consuming
+        // pop lands at exactly D, so b's `pop: 2` from depth D+2
+        // trips the guard and the parser advances one char.
+        //
+        // Rule order matters: `z` precedes `""` so the consuming match
+        // wins at byte 0; the multi-push only fires at byte 1 (EOL),
+        // exercising the guard without the empty rule swallowing `z`.
+        let syntax = r#"
+name: test
+scope: source.test
+contexts:
+  main:
+    - match: z
+      scope: test.main.z
+    - match: ""
+      push: [a, b, c]
+  a: []
+  b:
+    - match: ""
+      pop: 2
+  c:
+    - match: ""
+      pop: 1
+"#;
+        expect_scope_stacks("z", &["<source.test>, <test.main.z>"], syntax);
     }
 
     #[test]

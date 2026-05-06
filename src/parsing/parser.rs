@@ -103,13 +103,12 @@ pub struct ParseState {
     /// Pending-lines index that `flushed_ops[0]` maps to when `flushed_ops`
     /// is non-empty. Reset to `None` between `parse_line` calls.
     flushed_ops_start: Option<usize>,
-    /// Identity of the branch point whose cross-line replay produced
-    /// `flushed_ops`. `None` when `flushed_ops_start` is `None`.
-    /// Used by `prefer_inner_replay_corrections` to discriminate
-    /// between an inner BP whose correction is structurally a refinement
-    /// of the outer BP's resolved alternative (prefer) vs. one that
-    /// would over-apply (keep outer).
-    flushed_ops_bp: Option<BpInfo>,
+    /// Identity of the branch point whose cross-line replay wrote each
+    /// slot of `flushed_ops`. Indexed identically to `flushed_ops`
+    /// (length always matches). Each slot remembers the BP whose replay
+    /// produced its current ops, so subsequent merges can compare
+    /// per-slot rather than per-buffer.
+    flushed_ops_bp_per_slot: Vec<BpInfo>,
     /// Warnings accumulated during parsing, drained into `ParseLineOutput`.
     warnings: Vec<String>,
     /// Active escape patterns from embed operations. The escape regex takes
@@ -173,6 +172,16 @@ struct BpInfo {
     stack_depth: usize,
     /// Line number at branch creation (mirrors `BranchPoint::line_number`).
     line_number: usize,
+    /// The inner BP whose cross-line replay actually wrote this slot's
+    /// content (when an outer's `merge_flushed` is rolling up an
+    /// inner-substituted slot via `prefer_inner_replay_corrections`).
+    /// `None` when the outer BP itself wrote the slot. Boxed to keep
+    /// `BpInfo` small in the common case. Cluster-A diagnostic
+    /// (`cross_line_chained_fail_pushes_target_meta_scope_on_continuation_line`)
+    /// uses this to discriminate `SnapGtStart` merge slots that share an
+    /// identical `(name, depth, line)` outer attribution but differ in
+    /// the inner BP whose replay produced them.
+    inner_producer: Option<Box<BpInfo>>,
 }
 
 /// Bookkeeping override used while `handle_fail` is re-parsing a
@@ -425,7 +434,7 @@ impl ParseState {
             pending_line_start_shadows: Vec::new(),
             flushed_ops: Vec::new(),
             flushed_ops_start: None,
-            flushed_ops_bp: None,
+            flushed_ops_bp_per_slot: Vec::new(),
             warnings: Vec::new(),
             escape_stack: Vec::new(),
             shadow: ScopeStack::new(),
@@ -490,7 +499,7 @@ impl ParseState {
         // parse above.  These are stored by `handle_fail` in `self.flushed_ops`.
         let replayed = std::mem::take(&mut self.flushed_ops);
         self.flushed_ops_start = None;
-        self.flushed_ops_bp = None;
+        self.flushed_ops_bp_per_slot.clear();
 
         // Update shadow to reflect consumer's view at end of this line.
         // The consumer (see `syntest`) resets its scope stack to
@@ -1226,35 +1235,128 @@ impl ParseState {
     /// - `snap <= a`: new fail supersedes everything; replace.
     /// - `snap > a`: keep `[a..snap)` from prior fails, replace `[snap..N)`.
     ///
-    /// `bp_info` records the BP whose replay produced `new_ops`; stored
-    /// alongside `flushed_ops_start` for later use by
-    /// `prefer_inner_replay_corrections`. When two cross-line fails on
-    /// the same `parse_line` both contribute, we keep the BP info of the
-    /// one that ultimately owns the prefix (matches the start-replacement
-    /// rules above).
+    /// `new_per_slot_bp` records the BP attribution for each new slot;
+    /// stored per slot in `flushed_ops_bp_per_slot` so subsequent merges
+    /// can compare against the BP that owns each individual slot rather
+    /// than a single BP for the whole buffer. When two cross-line fails
+    /// on the same `parse_line` both contribute slots, each slot's BP
+    /// reflects which fail wrote it. When `prefer_inner_replay_corrections`
+    /// substituted a slot from inner replay, that slot's `BpInfo`
+    /// surfaces the inner producer via `inner_producer` — finer-grained
+    /// attribution than rolling everything up to the outer BP.
     fn merge_flushed(
         &mut self,
         snap: usize,
         new_ops: Vec<Vec<(usize, ScopeStackOp)>>,
-        bp_info: BpInfo,
+        new_per_slot_bp: Vec<BpInfo>,
     ) {
+        let new_len = new_ops.len();
+        debug_assert_eq!(new_len, new_per_slot_bp.len());
+        // For SnapLeStart's per-slot line-number discriminator and
+        // for trace events, we need the new BP's line_number — outer
+        // attribution is uniform across the call (slots may carry
+        // distinct inner_producers but share the outer's line/depth),
+        // so reading slot 0 is representative. Fall back to `0` for
+        // an empty merge (no slots to compare against anyway).
+        let new_bp_line_number = new_per_slot_bp.first().map(|b| b.line_number).unwrap_or(0);
         match self.flushed_ops_start {
             None => {
                 self.flushed_ops = new_ops;
                 self.flushed_ops_start = Some(snap);
-                self.flushed_ops_bp = Some(bp_info);
+                self.flushed_ops_bp_per_slot = new_per_slot_bp;
             }
             Some(start) if snap <= start => {
-                self.flushed_ops = new_ops;
+                // Per-slot line-number discriminator: a prior slot
+                // established by a BP from a later line is finer-grained
+                // than the wrapping earlier-line retry that's now
+                // overwriting. Preserve such slots; let equal/earlier-line
+                // priors fall through to the overwrite (peer-BP arbitration
+                // at the same line, or a fresher finding).
+                let prior_len = self.flushed_ops.len();
+                let overlap_end = (start + prior_len).min(snap + new_len);
+                let mut composed_ops = new_ops;
+                let mut composed_bp = new_per_slot_bp;
+                for abs in start..overlap_end {
+                    let prior_idx = abs - start;
+                    let new_idx = abs - snap;
+                    if self.flushed_ops_bp_per_slot[prior_idx].line_number > new_bp_line_number {
+                        composed_ops[new_idx] = std::mem::take(&mut self.flushed_ops[prior_idx]);
+                        composed_bp[new_idx] = self.flushed_ops_bp_per_slot[prior_idx].clone();
+                    }
+                }
+                self.flushed_ops = composed_ops;
                 self.flushed_ops_start = Some(snap);
-                self.flushed_ops_bp = Some(bp_info);
+                self.flushed_ops_bp_per_slot = composed_bp;
             }
             Some(start) => {
+                // Per-slot effective-depth discriminator in the
+                // [snap..overlap_end) range. A prior slot's effective
+                // producer depth is the max of its own `stack_depth`
+                // and any recursive `inner_producer` chain; preserve
+                // the prior when its effective depth strictly exceeds
+                // the new BP's. Cluster A's killing inner-most
+                // `groups(d=4,l=3)` overwrite of `AQI(d=5,l=1)` slots
+                // (eff prior=5 > new=4) gets preserved here; rolled-up
+                // later merges keep firing because the surviving
+                // slots' `inner_producer` chains carry the AQI depth
+                // forward
+                // (`cross_line_chained_fail_pushes_target_meta_scope_on_continuation_line`,
+                // probe prose at `parser.rs:10270`+).
+                let prior_ops = std::mem::take(&mut self.flushed_ops);
+                let prior_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
+                let prior_len = prior_ops.len();
                 let keep = snap - start;
-                self.flushed_ops.truncate(keep);
-                self.flushed_ops.extend(new_ops);
+                let overlap_end = (start + prior_len).min(snap + new_len);
+                let overlap_count = overlap_end.saturating_sub(snap);
+                let mut composed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
+                    Vec::with_capacity(keep + new_len);
+                let mut composed_bp: Vec<BpInfo> = Vec::with_capacity(keep + new_len);
+                let mut prior_ops_iter = prior_ops.into_iter();
+                let mut prior_bp_iter = prior_bp.into_iter();
+                let mut new_ops_iter = new_ops.into_iter();
+                let mut new_bp_iter = new_per_slot_bp.into_iter();
+                for _ in 0..keep {
+                    composed_ops.push(prior_ops_iter.next().unwrap());
+                    composed_bp.push(prior_bp_iter.next().unwrap());
+                }
+                for _ in 0..overlap_count {
+                    let new_op = new_ops_iter.next().unwrap();
+                    let new_bp = new_bp_iter.next().unwrap();
+                    let prior_op = prior_ops_iter.next().unwrap();
+                    let prior_bp_slot = prior_bp_iter.next().unwrap();
+                    if Self::effective_producer_depth(&prior_bp_slot)
+                        > Self::effective_producer_depth(&new_bp)
+                    {
+                        composed_ops.push(prior_op);
+                        composed_bp.push(prior_bp_slot);
+                    } else {
+                        composed_ops.push(new_op);
+                        composed_bp.push(new_bp);
+                    }
+                }
+                composed_ops.extend(new_ops_iter);
+                composed_bp.extend(new_bp_iter);
+                self.flushed_ops = composed_ops;
+                // SnapGtStart preserves the prior buffer's start
+                // index — `keep` prior slots remain before the
+                // overlap/new tail. Original truncate-and-extend
+                // didn't touch `flushed_ops_start` either.
+                self.flushed_ops_start = Some(start);
+                self.flushed_ops_bp_per_slot = composed_bp;
             }
         }
+    }
+
+    fn effective_producer_depth(bp: &BpInfo) -> usize {
+        let mut d = bp.stack_depth;
+        let mut cur = bp.inner_producer.as_deref();
+        while let Some(c) = cur {
+            if c.stack_depth > d {
+                d = c.stack_depth;
+            }
+            cur = c.inner_producer.as_deref();
+        }
+        d
     }
 
     /// Replace `replayed_ops[i]` with `inner_ops` for overlapping
@@ -1276,12 +1378,15 @@ impl ParseState {
     /// branch family, and inner's `name`-alt CORRECTLY supersedes
     /// outer's locally-computed `path`-alt freeze.
     fn prefer_inner_replay_corrections(
+        &mut self,
         outer_snap: usize,
         replayed_ops: &mut [Vec<(usize, ScopeStackOp)>],
+        replayed_per_slot_bp: &mut [BpInfo],
         inner_ops: &[Vec<(usize, ScopeStackOp)>],
         inner_start: usize,
         outer_bp: &BpInfo,
         inner_bp: Option<&BpInfo>,
+        inner_corrections_bp: &[BpInfo],
     ) {
         // Two regimes:
         //
@@ -1316,19 +1421,59 @@ impl ParseState {
             inner_bp.map(|inner| inner.stack_depth as isize - outer_bp.stack_depth as isize);
         let in_depth_window = matches!(depth_diff, Some(0) | Some(1));
         let allow_deep_extension = matches!(depth_diff, Some(d) if d > 1);
-        for (i, outer_local) in replayed_ops.iter_mut().enumerate() {
+        debug_assert_eq!(replayed_ops.len(), replayed_per_slot_bp.len());
+        // Helper closure: build the per-slot BpInfo recorded for a
+        // slot we just substituted from inner replay. Outer attribution
+        // is preserved (so subsequent line/depth comparisons against
+        // the outer wrapping BP keep working) and the inner producer
+        // is recorded under `inner_producer` for finer-grained
+        // discrimination at the next merge. `slot_inner_bp` already
+        // carries any deeper nested attribution recursively.
+        let attribute_substituted = |slot_inner_bp: Option<&BpInfo>| -> BpInfo {
+            let producer = slot_inner_bp
+                .cloned()
+                .or_else(|| inner_bp.cloned())
+                .expect("substitution path requires an inner producer");
+            BpInfo {
+                name: outer_bp.name.clone(),
+                stack_depth: outer_bp.stack_depth,
+                line_number: outer_bp.line_number,
+                inner_producer: Some(Box::new(producer)),
+            }
+        };
+        for (i, (outer_local, slot_bp_attr)) in replayed_ops
+            .iter_mut()
+            .zip(replayed_per_slot_bp.iter_mut())
+            .enumerate()
+        {
             let global_i = outer_snap + i;
             if global_i < inner_start {
                 continue;
             }
             let inner_idx = global_i - inner_start;
+            let slot_inner_bp = inner_corrections_bp.get(inner_idx);
+            // Per-slot line-number escape valve: an inner correction
+            // whose BP was created on a later line than outer's wrapping
+            // BP carries finer-grained context that outer's recompute
+            // can't reproduce. Substitute regardless of depth.
+            let slot_line_overrides = matches!(
+                slot_inner_bp,
+                Some(sib) if sib.line_number > outer_bp.line_number
+            );
             if let Some(corrected) = inner_ops.get(inner_idx) {
                 if in_depth_window {
                     *outer_local = corrected.clone();
+                    *slot_bp_attr = attribute_substituted(slot_inner_bp);
+                } else if slot_line_overrides {
+                    *outer_local = corrected.clone();
+                    *slot_bp_attr = attribute_substituted(slot_inner_bp);
                 } else if allow_deep_extension && Self::inner_extends_outer(outer_local, corrected)
                 {
                     *outer_local = corrected.clone();
+                    *slot_bp_attr = attribute_substituted(slot_inner_bp);
+                } else {
                 }
+            } else {
             }
         }
     }
@@ -1461,6 +1606,7 @@ impl ParseState {
                 name: bp.name.clone(),
                 stack_depth: bp.stack_depth,
                 line_number: bp.line_number,
+                inner_producer: None,
             };
             self.branch_points.remove(bp_index);
 
@@ -1492,7 +1638,7 @@ impl ParseState {
                 // write into a clean slot we can detect afterward.
                 let saved_flushed = std::mem::take(&mut self.flushed_ops);
                 let saved_flushed_start = self.flushed_ops_start.take();
-                let saved_flushed_bp = self.flushed_ops_bp.take();
+                let saved_flushed_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
                 let mut replayed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
                     Vec::with_capacity(truncated_lines.len());
                 for (i, replay_line) in truncated_lines.iter().enumerate() {
@@ -1534,26 +1680,31 @@ impl ParseState {
                 // then prefer the inner corrections for overlapping indices.
                 let inner_corrections = std::mem::take(&mut self.flushed_ops);
                 let inner_corrections_start = self.flushed_ops_start.take();
-                let inner_corrections_bp = self.flushed_ops_bp.take();
+                let inner_corrections_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
                 self.flushed_ops = saved_flushed;
                 self.flushed_ops_start = saved_flushed_start;
-                self.flushed_ops_bp = saved_flushed_bp;
+                self.flushed_ops_bp_per_slot = saved_flushed_bp;
+                let mut replayed_per_slot_bp: Vec<BpInfo> =
+                    vec![outer_bp_info.clone(); replayed_ops.len()];
                 if let Some(start) = inner_corrections_start {
                     if !inner_corrections.is_empty() {
-                        Self::prefer_inner_replay_corrections(
+                        let inner_bp_first = inner_corrections_bp.first().cloned();
+                        self.prefer_inner_replay_corrections(
                             pending_lines_snapshot_len,
                             &mut replayed_ops,
+                            &mut replayed_per_slot_bp,
                             &inner_corrections,
                             start,
                             &outer_bp_info,
-                            inner_corrections_bp.as_ref(),
+                            inner_bp_first.as_ref(),
+                            &inner_corrections_bp,
                         );
                     }
                 }
                 self.merge_flushed(
                     pending_lines_snapshot_len,
                     replayed_ops,
-                    outer_bp_info.clone(),
+                    replayed_per_slot_bp,
                 );
 
                 // Restart the current line from the beginning under the
@@ -1607,6 +1758,7 @@ impl ParseState {
             name: bp.name.clone(),
             stack_depth: bp.stack_depth,
             line_number: bp.line_number,
+            inner_producer: None,
         };
         // bp borrow ends here.
 
@@ -1743,7 +1895,7 @@ impl ParseState {
             // into a clean slot we can detect afterward.
             let saved_flushed = std::mem::take(&mut self.flushed_ops);
             let saved_flushed_start = self.flushed_ops_start.take();
-            let saved_flushed_bp = self.flushed_ops_bp.take();
+            let saved_flushed_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
 
             let mut replayed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
                 Vec::with_capacity(truncated_lines.len());
@@ -1793,26 +1945,31 @@ impl ParseState {
             // resolution arrived (during line-2 reparse).
             let inner_corrections = std::mem::take(&mut self.flushed_ops);
             let inner_corrections_start = self.flushed_ops_start.take();
-            let inner_corrections_bp = self.flushed_ops_bp.take();
+            let inner_corrections_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
             self.flushed_ops = saved_flushed;
             self.flushed_ops_start = saved_flushed_start;
-            self.flushed_ops_bp = saved_flushed_bp;
+            self.flushed_ops_bp_per_slot = saved_flushed_bp;
+            let mut replayed_per_slot_bp: Vec<BpInfo> =
+                vec![outer_bp_info.clone(); replayed_ops.len()];
             if let Some(start) = inner_corrections_start {
                 if !inner_corrections.is_empty() {
-                    Self::prefer_inner_replay_corrections(
+                    let inner_bp_first = inner_corrections_bp.first().cloned();
+                    self.prefer_inner_replay_corrections(
                         pending_lines_snapshot_len,
                         &mut replayed_ops,
+                        &mut replayed_per_slot_bp,
                         &inner_corrections,
                         start,
                         &outer_bp_info,
-                        inner_corrections_bp.as_ref(),
+                        inner_bp_first.as_ref(),
+                        &inner_corrections_bp,
                     );
                 }
             }
             self.merge_flushed(
                 pending_lines_snapshot_len,
                 replayed_ops,
-                outer_bp_info.clone(),
+                replayed_per_slot_bp,
             );
 
             // Restart the current line from the beginning.
@@ -9521,6 +9678,287 @@ contexts:
              cross-line retry to qualified alt (its meta_scope is \
              `meta.annotation.identifier.java meta.path.java`); stack: {:?}",
             at_at,
+        );
+    }
+
+    /// Asserts the leaf scope at line 3's `Anno` in the qualified-identifier annotation
+    /// `@Anno\n.\nAnno\n(par=1)\nenum E {}`. Line 4's `(` rewinds to line 2's
+    /// `annotation-qualified-identifier` BP; the retry's alt 1 must overwrite line 3's
+    /// previously-emitted `variable.namespace.java` with `variable.annotation.java`. Defends
+    /// the per-slot line-number discriminator that lets later-line corrections survive a
+    /// wrapping earlier-line retry. Mirrors `syntax_test_java.java:2221`.
+    #[cfg(feature = "default-onig")]
+    #[test]
+    fn cross_line_chained_fail_swaps_leaf_scope_on_buffered_line() {
+        use crate::parsing::SyntaxSet;
+        struct Record {
+            stack_before: ScopeStack,
+            ops: Vec<(usize, ScopeStackOp)>,
+        }
+        let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
+        let syntax = ss
+            .find_syntax_by_path("Packages/Java/Java.sublime-syntax")
+            .unwrap();
+        let mut state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
+        let mut buffer: Vec<Record> = Vec::new();
+        for line in ["@Anno\n", ".\n", "Anno\n", "(par=1)\n", "enum E {}\n"] {
+            let out = state.parse_line(line, &ss).expect("parse");
+            if !out.replayed.is_empty() {
+                let buf_len = buffer.len();
+                let start_idx = buf_len - out.replayed.len();
+                stack = buffer[start_idx].stack_before.clone();
+                let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> =
+                    Vec::new();
+                for (i, replayed_ops) in out.replayed.iter().enumerate() {
+                    for (_, op) in replayed_ops {
+                        let _ = stack.apply(op);
+                    }
+                    let next_idx = start_idx + i + 1;
+                    if next_idx < buf_len {
+                        corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
+                    }
+                    if let Some(rec) = buffer.get_mut(start_idx + i) {
+                        rec.ops = replayed_ops.clone();
+                    }
+                }
+                for (idx, c_stack, _) in corrected {
+                    buffer[idx].stack_before = c_stack;
+                }
+            }
+            let stack_before = stack.clone();
+            for (_, op) in &out.ops {
+                let _ = stack.apply(op);
+            }
+            buffer.push(Record {
+                stack_before,
+                ops: out.ops.clone(),
+            });
+        }
+        // Reconstruct the running scope at byte 0 of line 3 (the inner `Anno`).
+        let line2 = &buffer[2];
+        let mut at_anno = line2.stack_before.clone();
+        for (pos, op) in &line2.ops {
+            if *pos > 0 {
+                break;
+            }
+            let _ = at_anno.apply(op);
+        }
+        let var_anno = Scope::new("variable.annotation.java").unwrap();
+        let var_ns = Scope::new("variable.namespace.java").unwrap();
+        assert!(
+            !at_anno.as_slice().contains(&var_ns),
+            "variable.namespace.java (alt 0 -path leaf) must NOT be on \
+             the stack at line 3's `Anno`; the cross-line retry to alt 1 \
+             -name should have replaced it. ST emits \
+             `variable.annotation.java` here (per syntax_test_java.java:2221). \
+             stack: {:?}",
+            at_anno,
+        );
+        assert!(
+            at_anno.as_slice().contains(&var_anno),
+            "variable.annotation.java (alt 1 -name leaf) must be on the \
+             stack at line 3's `Anno` after cross-line retry. \
+             stack: {:?}",
+            at_anno,
+        );
+    }
+
+    /// Asserts `meta.annotation.parameters.java` at the `(` of an annotation argument list
+    /// when the body spans multiple comment-broken lines (`@Anno\n.\nAnno\n(\npar\n=\n1\n)\n
+    /// enum E {}`). Defends the SnapGtStart effective-depth discriminator: when a `groups` BP
+    /// rolls up over slots whose effective producer (via `inner_producer` chain) is strictly
+    /// deeper, the prior slots are preserved instead of overwritten by the shallower `groups`
+    /// extension. Mirrors `syntax_test_java.java:2223`.
+    #[cfg(feature = "default-onig")]
+    #[test]
+    fn cross_line_chained_fail_pushes_target_meta_scope_on_continuation_line() {
+        use crate::parsing::SyntaxSet;
+        struct Record {
+            stack_before: ScopeStack,
+            ops: Vec<(usize, ScopeStackOp)>,
+        }
+        let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
+        let syntax = ss
+            .find_syntax_by_path("Packages/Java/Java.sublime-syntax")
+            .unwrap();
+        let mut state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
+        let mut buffer: Vec<Record> = Vec::new();
+        // Mirror the real fixture (`syntax_test_java.java:2216-2231`):
+        // each token on its own line with trailing `// comment`. The
+        // `(par=1)` is split across five lines, with `par`/`=`/`1`
+        // indented. Buffer indices: 0=@Anno, 1=., 2=Anno, 3=(, 4=par,
+        // 5==, 6=1, 7=), 8=enum E {}.
+        for line in [
+            "@Anno           // comment\n",
+            ".               // comment\n",
+            "Anno            // comment\n",
+            "(               // comment\n",
+            "   par          // comment\n",
+            "   =            // comment\n",
+            "   1            // comment\n",
+            ")               // comment\n",
+            "enum E {}\n",
+        ] {
+            let out = state.parse_line(line, &ss).expect("parse");
+            if !out.replayed.is_empty() {
+                let buf_len = buffer.len();
+                let start_idx = buf_len - out.replayed.len();
+                stack = buffer[start_idx].stack_before.clone();
+                let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> =
+                    Vec::new();
+                for (i, replayed_ops) in out.replayed.iter().enumerate() {
+                    for (_, op) in replayed_ops {
+                        let _ = stack.apply(op);
+                    }
+                    let next_idx = start_idx + i + 1;
+                    if next_idx < buf_len {
+                        corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
+                    }
+                    if let Some(rec) = buffer.get_mut(start_idx + i) {
+                        rec.ops = replayed_ops.clone();
+                    }
+                }
+                for (idx, c_stack, _) in corrected {
+                    buffer[idx].stack_before = c_stack;
+                }
+            }
+            let stack_before = stack.clone();
+            for (_, op) in &out.ops {
+                let _ = stack.apply(op);
+            }
+            buffer.push(Record {
+                stack_before,
+                ops: out.ops.clone(),
+            });
+        }
+        // Reconstruct the running scope at byte 0 of buffer[3] (the `(`).
+        // Apply ops with pos == 0 to capture the post-`(` stack (the
+        // `(` token's scope is set by `set: annotation-parameters-body`).
+        let line3 = &buffer[3];
+        let mut at_paren = line3.stack_before.clone();
+        for (pos, op) in &line3.ops {
+            if *pos > 0 {
+                break;
+            }
+            let _ = at_paren.apply(op);
+        }
+        let params = Scope::new("meta.annotation.parameters.java").unwrap();
+        let group = Scope::new("meta.group.java").unwrap();
+        let identifier = Scope::new("meta.annotation.identifier.java").unwrap();
+        assert!(
+            at_paren.as_slice().contains(&params),
+            "meta.annotation.parameters.java must be on the stack at \
+             byte 0 of `(par=1)` after the cross-line retry to alt 1 \
+             carries the parser into `annotation-parameters-body`. ST \
+             emits `meta.annotation.parameters.java meta.group.java \
+             punctuation.section.group.begin.java` here (per \
+             syntax_test_java.java:2223). stack: {:?}",
+            at_paren,
+        );
+        assert!(
+            at_paren.as_slice().contains(&group),
+            "meta.group.java must be on the stack at byte 0 of `(par=1)` \
+             (the second meta_scope of `annotation-parameters-body`). \
+             stack: {:?}",
+            at_paren,
+        );
+        assert!(
+            !at_paren.as_slice().contains(&identifier),
+            "meta.annotation.identifier.java must NOT be on the stack at \
+             byte 0 of `(par=1)`; the `set: annotation-parameters-body` \
+             on the `(` match drops the wrapping `-parameters` context's \
+             meta_content_scope. stack: {:?}",
+            at_paren,
+        );
+    }
+
+    /// Inline-fixture companion to `..._on_continuation_line`: same `(par=1)` target on a
+    /// single line (`@Anno\n.\nAnno\n(par=1)\nenum E {}`) where the SnapGtStart roll-up never
+    /// fires. Defends the same-line baseline behaviour against regressions from the
+    /// effective-depth discriminator.
+    #[cfg(feature = "default-onig")]
+    #[test]
+    fn cross_line_chained_fail_pushes_target_meta_scope_on_inline_continuation() {
+        use crate::parsing::SyntaxSet;
+        struct Record {
+            stack_before: ScopeStack,
+            ops: Vec<(usize, ScopeStackOp)>,
+        }
+        let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
+        let syntax = ss
+            .find_syntax_by_path("Packages/Java/Java.sublime-syntax")
+            .unwrap();
+        let mut state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
+        let mut buffer: Vec<Record> = Vec::new();
+        for line in ["@Anno\n", ".\n", "Anno\n", "(par=1)\n", "enum E {}\n"] {
+            let out = state.parse_line(line, &ss).expect("parse");
+            if !out.replayed.is_empty() {
+                let buf_len = buffer.len();
+                let start_idx = buf_len - out.replayed.len();
+                stack = buffer[start_idx].stack_before.clone();
+                let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> =
+                    Vec::new();
+                for (i, replayed_ops) in out.replayed.iter().enumerate() {
+                    for (_, op) in replayed_ops {
+                        let _ = stack.apply(op);
+                    }
+                    let next_idx = start_idx + i + 1;
+                    if next_idx < buf_len {
+                        corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
+                    }
+                    if let Some(rec) = buffer.get_mut(start_idx + i) {
+                        rec.ops = replayed_ops.clone();
+                    }
+                }
+                for (idx, c_stack, _) in corrected {
+                    buffer[idx].stack_before = c_stack;
+                }
+            }
+            let stack_before = stack.clone();
+            for (_, op) in &out.ops {
+                let _ = stack.apply(op);
+            }
+            buffer.push(Record {
+                stack_before,
+                ops: out.ops.clone(),
+            });
+        }
+        // Reconstruct the running scope at byte 0 of buffer[3] (the `(`).
+        let line3 = &buffer[3];
+        let mut at_paren = line3.stack_before.clone();
+        for (pos, op) in &line3.ops {
+            if *pos > 0 {
+                break;
+            }
+            let _ = at_paren.apply(op);
+        }
+        let params = Scope::new("meta.annotation.parameters.java").unwrap();
+        let group = Scope::new("meta.group.java").unwrap();
+        let identifier = Scope::new("meta.annotation.identifier.java").unwrap();
+        assert!(
+            at_paren.as_slice().contains(&params),
+            "meta.annotation.parameters.java must be on the stack at \
+             byte 0 of `(par=1)` on the simple inline fixture (cluster-A \
+             passing companion). stack: {:?}",
+            at_paren,
+        );
+        assert!(
+            at_paren.as_slice().contains(&group),
+            "meta.group.java must be on the stack at byte 0 of `(par=1)` \
+             on the simple inline fixture. stack: {:?}",
+            at_paren,
+        );
+        assert!(
+            !at_paren.as_slice().contains(&identifier),
+            "meta.annotation.identifier.java must NOT be on the stack at \
+             byte 0 of `(par=1)` on the simple inline fixture; the \
+             `set: annotation-parameters-body` on the `(` match drops \
+             the wrapping `-parameters` context's meta_content_scope. \
+             stack: {:?}",
+            at_paren,
         );
     }
 }

@@ -1,3 +1,2 @@
 loading syntax definitions from testdata/Packages
-FAILED testdata/Packages/Java/tests/syntax_test_java.java: 75
-exiting with code 1
+exiting with code 0

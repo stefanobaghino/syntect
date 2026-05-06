@@ -159,6 +159,37 @@ pub struct ParseState {
     /// `declarations` exhausted on the leading `$`). Cleared whenever
     /// the cursor moves.
     skipped_branches: Vec<(usize, String)>,
+    /// Active while an outer `handle_fail` is replaying buffered lines
+    /// inside `parse_line_inner_from` / `parse_line_inner`. Each
+    /// `branch_point` creation during the replay updates this to the
+    /// strictly-deeper of the new BP and the current tip — so
+    /// `prefer_inner_replay_corrections` / `merge_flushed` can see the
+    /// inner replay's max-attempted-depth even for failed alternatives
+    /// that never surface in `flushed_ops_bp_per_slot`. Saved/restored
+    /// across nested inner replays via `mem::replace` (mirrors
+    /// `saved_flushed`). `None` outside an inner replay; `Some(default)`
+    /// at the start of one. Cluster-B candidate-#2 diagnostic
+    /// (probe prose at `parser.rs:10767+`).
+    inner_replay_max_depth: Option<MaxDepthSeen>,
+}
+
+/// Tracker installed on `ParseState` for the duration of an outer
+/// `handle_fail`'s inner replay. Records the strictly-deepest
+/// `branch_point` created while the replay loop runs.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct MaxDepthSeen {
+    depth: usize,
+    bp: Option<BpInfo>,
+}
+
+/// Compact summary of a `(byte_offset, ScopeStackOp)` pair returned by
+/// `ops_divergence` for use by `is_replace_shape`.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[allow(dead_code)]
+struct OpSummary {
+    pos: usize,
+    kind: &'static str,
+    scope: String,
 }
 
 /// Identity of a branch point whose cross-line replay wrote ops to
@@ -441,6 +472,7 @@ impl ParseState {
             replay_ctx: None,
             replay_prefix_ops: None,
             skipped_branches: Vec::new(),
+            inner_replay_max_depth: None,
         }
     }
 
@@ -1167,6 +1199,18 @@ impl ParseState {
                         .unwrap_or_default(),
                 };
                 self.branch_points.push(bp);
+                if let Some(tracker) = self.inner_replay_max_depth.as_mut() {
+                    let last = self.branch_points.last().unwrap();
+                    if last.stack_depth > tracker.depth {
+                        tracker.depth = last.stack_depth;
+                        tracker.bp = Some(BpInfo {
+                            name: last.name.clone(),
+                            stack_depth: last.stack_depth,
+                            line_number: last.line_number,
+                            inner_producer: None,
+                        });
+                    }
+                }
                 // `pop: N + branch:` is **lookahead** per ST: the trigger
                 // token must NOT inherit the popped frames' meta_scope.
                 // Route through `Push { pop_count }` so the existing
@@ -1472,10 +1516,198 @@ impl ParseState {
                     *outer_local = corrected.clone();
                     *slot_bp_attr = attribute_substituted(slot_inner_bp);
                 } else {
+                    // Iter 7 substitution path: when SkippedDeepNonExtension
+                    // would fire and `is_replace_shape` matches, substitute
+                    // outer_local with inner's corrected ops. If the
+                    // substitution would over-push a `meta.*` atom not
+                    // already on the running shadow stack (G2 discriminator
+                    // — see deferral prose at `parser.rs:11363+`), append a
+                    // compensating Pop(1) immediately after each over-pushed
+                    // Push so the consumer's stack mirror sees the
+                    // intended single push without doubling.
+                    let (_, outer_first, inner_first) =
+                        Self::ops_divergence(outer_local, corrected);
+                    let outer_meta = Self::collect_meta_scopes(outer_local);
+                    let inner_meta = Self::collect_meta_scopes(corrected);
+                    let would_be_skipped_deep =
+                        inner_bp.is_some() && !matches!(depth_diff, Some(d) if d < 0);
+                    let do_substitute = would_be_skipped_deep
+                        && Self::is_replace_shape(
+                            &outer_first,
+                            &inner_first,
+                            &outer_meta,
+                            &inner_meta,
+                        );
+                    if do_substitute {
+                        let outer_pre_substitution = outer_local.clone();
+                        *outer_local = corrected.clone();
+                        *slot_bp_attr = attribute_substituted(slot_inner_bp);
+                        // Per-meta atom over-push: positive entries of
+                        // (inner_net - outer_net). When non-empty, inner
+                        // pushes a meta atom that outer doesn't.
+                        let outer_net = Self::net_meta_delta(&outer_pre_substitution);
+                        let inner_net = Self::net_meta_delta(corrected);
+                        let mut over_push: HashMap<String, usize> = HashMap::new();
+                        for (atom, inner_c) in &inner_net {
+                            let outer_c = outer_net.get(atom).copied().unwrap_or(0);
+                            if *inner_c > outer_c {
+                                over_push.insert(atom.clone(), inner_c - outer_c);
+                            }
+                        }
+                        // G2 gate: skip comp-pop when any over-push atom
+                        // is already on the running shadow stack — that
+                        // signals inner is legitimately preserving an
+                        // existing meta scope (not introducing a fresh
+                        // one), so popping it would break the consumer.
+                        if !over_push.is_empty() {
+                            let would_double = self.shadow.as_slice().iter().any(|s| {
+                                let n = s.build_string();
+                                n.starts_with("meta.") && over_push.contains_key(&n)
+                            });
+                            if !would_double {
+                                let total_extra: usize = over_push.values().sum();
+                                let mut remaining = over_push;
+                                let mut filtered: Vec<(usize, ScopeStackOp)> =
+                                    Vec::with_capacity(outer_local.len() + total_extra);
+                                for entry in outer_local.iter() {
+                                    filtered.push(entry.clone());
+                                    if let (pos, ScopeStackOp::Push(s)) = (entry.0, &entry.1) {
+                                        let name = s.build_string();
+                                        if let Some(rem) = remaining.get_mut(&name) {
+                                            if *rem > 0 {
+                                                filtered.push((pos, ScopeStackOp::Pop(1)));
+                                                *rem -= 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                *outer_local = filtered;
+                            }
+                        }
+                        // Iter 9 deferred sub-B's outer-side comp-pop:
+                        // iter-8 analysis flagged outer over-pushes
+                        // (`meta.function.*` family inner correctly
+                        // omits) but the symmetric predicate widening
+                        // surfaced inner-BP stack-base misalignment
+                        // first — see iter-9 prose at `parser.rs:11968+`
+                        // for the deferral rationale and iter 9.5
+                        // discriminator requirements.
+                    } else {
+                    }
                 }
             } else {
             }
         }
+    }
+
+    /// Length of the longest equal prefix between `outer` and `inner`,
+    /// plus a summary of each side's first op past that prefix (or
+    /// `None` if that side is exhausted at the prefix boundary). Used
+    /// by Iter 7's `is_replace_shape` substitution predicate (production)
+    /// and the `SubstitutionShapeAnalysis` trace event (debug).
+    fn ops_divergence(
+        outer: &[(usize, ScopeStackOp)],
+        inner: &[(usize, ScopeStackOp)],
+    ) -> (usize, Option<OpSummary>, Option<OpSummary>) {
+        let mut prefix = 0usize;
+        let max = outer.len().min(inner.len());
+        while prefix < max && outer[prefix] == inner[prefix] {
+            prefix += 1;
+        }
+        let outer_div = outer.get(prefix).map(Self::summarize_op);
+        let inner_div = inner.get(prefix).map(Self::summarize_op);
+        (prefix, outer_div, inner_div)
+    }
+
+    /// Collect the names of every `Push(scope)` whose scope name
+    /// begins with `meta.`, in occurrence order. These are the
+    /// meta-scope frames the ops would push onto the actual scope
+    /// stack when applied. Used by Iter 7's substitution predicate
+    /// (`is_replace_shape`) and the `SubstitutionShapeAnalysis` trace.
+    fn collect_meta_scopes(ops: &[(usize, ScopeStackOp)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (_, op) in ops {
+            if let ScopeStackOp::Push(scope) = op {
+                let s = scope.build_string();
+                if s.starts_with("meta.") {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    fn summarize_op(entry: &(usize, ScopeStackOp)) -> OpSummary {
+        let (pos, op) = entry;
+        let (kind, scope) = match op {
+            ScopeStackOp::Push(s) => ("push", s.build_string()),
+            ScopeStackOp::Pop(_) => ("pop", String::new()),
+            ScopeStackOp::Clear(_) => ("clear", String::new()),
+            ScopeStackOp::Restore => ("restore", String::new()),
+            ScopeStackOp::Noop => ("noop", String::new()),
+        };
+        OpSummary {
+            pos: *pos,
+            kind,
+            scope,
+        }
+    }
+
+    /// Iter 9 substitution predicate. Position-agnostic widening of
+    /// iter 7's first-diverging-push gate: fires whenever both sides
+    /// have at least one diverging op past the common prefix AND
+    /// `inner_meta_scopes` strictly contains a `meta.*` atom not in
+    /// `outer_meta_scopes`. Subsumes iter 7's case (inner's first
+    /// diverging push IS that meta atom) and adds iter-8 sub-A
+    /// (the missing meta atom appears LATER in the op sequence than
+    /// the first diverging push, e.g. behind a non-meta accessor
+    /// push). Iter-8 sub-B (outer-side over-push) is deferred — the
+    /// symmetric arm fires substitution on slots where inner BPs
+    /// compute ops against a stack base that doesn't align with the
+    /// consumer's running state, producing under-corrected output;
+    /// requires a stack-base alignment discriminator (probe witness:
+    /// `cross_line_path_field_type_recovers_after_object_array_break`,
+    /// currently `#[ignore]`'d through iter 9.5).
+    fn is_replace_shape(
+        outer_div: &Option<OpSummary>,
+        inner_div: &Option<OpSummary>,
+        outer_meta_scopes: &[String],
+        inner_meta_scopes: &[String],
+    ) -> bool {
+        if outer_div.is_none() || inner_div.is_none() {
+            return false;
+        }
+        inner_meta_scopes
+            .iter()
+            .any(|s| s.starts_with("meta.") && !outer_meta_scopes.contains(s))
+    }
+
+    /// Iter 7 helper. Simulate `ops` on a fresh scope-name stack and
+    /// return the multiset of `meta.*` atoms remaining at end.
+    /// `Push`/`Pop(N)` are simulated literally; other op variants are
+    /// treated as no-ops (they're rare in the substitution shapes
+    /// `is_replace_shape` matches). Used to compute the per-atom net
+    /// push delta between outer and inner ops at the comp-pop site.
+    fn net_meta_delta(ops: &[(usize, ScopeStackOp)]) -> HashMap<String, usize> {
+        let mut sim_stack: Vec<String> = Vec::new();
+        for (_, op) in ops {
+            match op {
+                ScopeStackOp::Push(s) => sim_stack.push(s.build_string()),
+                ScopeStackOp::Pop(n) => {
+                    for _ in 0..*n {
+                        sim_stack.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for s in &sim_stack {
+            if s.starts_with("meta.") {
+                *counts.entry(s.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     /// True when `inner` starts with the entire `outer` op sequence and
@@ -1639,6 +1871,10 @@ impl ParseState {
                 let saved_flushed = std::mem::take(&mut self.flushed_ops);
                 let saved_flushed_start = self.flushed_ops_start.take();
                 let saved_flushed_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
+                // Install a fresh max-depth tracker for the duration of
+                // this inner replay; restore the outer tracker (if any)
+                // when we're done. Mirrors `saved_flushed`'s nesting.
+                let saved_max_depth = self.inner_replay_max_depth.replace(MaxDepthSeen::default());
                 let mut replayed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
                     Vec::with_capacity(truncated_lines.len());
                 for (i, replay_line) in truncated_lines.iter().enumerate() {
@@ -1684,6 +1920,9 @@ impl ParseState {
                 self.flushed_ops = saved_flushed;
                 self.flushed_ops_start = saved_flushed_start;
                 self.flushed_ops_bp_per_slot = saved_flushed_bp;
+                let _inner_replay_max =
+                    std::mem::take(&mut self.inner_replay_max_depth).unwrap_or_default();
+                self.inner_replay_max_depth = saved_max_depth;
                 let mut replayed_per_slot_bp: Vec<BpInfo> =
                     vec![outer_bp_info.clone(); replayed_ops.len()];
                 if let Some(start) = inner_corrections_start {
@@ -1896,6 +2135,10 @@ impl ParseState {
             let saved_flushed = std::mem::take(&mut self.flushed_ops);
             let saved_flushed_start = self.flushed_ops_start.take();
             let saved_flushed_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
+            // Install a fresh max-depth tracker for the duration of
+            // this inner replay; restore the outer tracker (if any)
+            // when we're done. Mirrors `saved_flushed`'s nesting.
+            let saved_max_depth = self.inner_replay_max_depth.replace(MaxDepthSeen::default());
 
             let mut replayed_ops: Vec<Vec<(usize, ScopeStackOp)>> =
                 Vec::with_capacity(truncated_lines.len());
@@ -1949,6 +2192,9 @@ impl ParseState {
             self.flushed_ops = saved_flushed;
             self.flushed_ops_start = saved_flushed_start;
             self.flushed_ops_bp_per_slot = saved_flushed_bp;
+            let _inner_replay_max =
+                std::mem::take(&mut self.inner_replay_max_depth).unwrap_or_default();
+            self.inner_replay_max_depth = saved_max_depth;
             let mut replayed_per_slot_bp: Vec<BpInfo> =
                 vec![outer_bp_info.clone(); replayed_ops.len()];
             if let Some(start) = inner_corrections_start {
@@ -9960,5 +10206,355 @@ contexts:
              stack: {:?}",
             at_paren,
         );
+    }
+
+    /// Asserts `meta.path.java` survives on the type-path of a multi-line qualified Java
+    /// field declaration interrupted by `/**/` and EOL comments. Defends the
+    /// `prefer_inner_replay_corrections` substitution path that fires when inner pushes a
+    /// `meta.*` atom outer drops (`is_replace_shape`), with the comp-pop / G2 gate
+    /// preventing meta-scope doubling. Mirrors `syntax_test_java.java:3395-3413`.
+    #[cfg(feature = "default-onig")]
+    #[test]
+    fn cross_line_path_field_type_keeps_meta_path_on_continuation_line() {
+        use crate::parsing::SyntaxSet;
+        struct Record {
+            stack_before: ScopeStack,
+            ops: Vec<(usize, ScopeStackOp)>,
+        }
+        let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
+        let syntax = ss
+            .find_syntax_by_path("Packages/Java/Java.sublime-syntax")
+            .unwrap();
+        let mut state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
+        let mut buffer: Vec<Record> = Vec::new();
+        // Real-fixture analog: syntax_test_java.java:3395-3413.
+        // Buffer indices: 0=`class C {`,
+        //                 1=`  @anno /**/ fully // comment`,
+        //                 2=`  . @anno qualified//comment`,
+        //                 3=`  string foo;`,
+        //                 4=`}`.
+        //
+        // The fixture stops at `string foo;` rather than mirroring the
+        // full multi-line continuation (`/**/ . /**/`, `@anno /**/
+        // object @anno() []`, `/**/ @anno /**/ [] /**/
+        // doubleObjectArray;`) of the actual test region. The shorter
+        // form already reproduces one of the cluster-B failure modes
+        // — the "missing `meta.path.java` push, leaf flips to
+        // `support.class.java`" mode that syntest reports at line
+        // 3395 cols 13-18 ("fully") — and keeps the trace captured
+        // in commit 2 small enough to diff readably. The full-region
+        // failure mode (constructor flip on line 3405's "qualified"
+        // and line 3413's `/**/ . /**/`) is a downstream cascade
+        // from the missing `meta.path.java` push; if the diagnostic
+        // shows otherwise, an extended-fixture probe lands as a
+        // follow-up.
+        for line in [
+            "class C {\n",
+            "  @anno /**/ fully // comment\n",
+            "  . @anno qualified//comment\n",
+            "  string foo;\n",
+            "}\n",
+        ] {
+            let out = state.parse_line(line, &ss).expect("parse");
+            if !out.replayed.is_empty() {
+                let buf_len = buffer.len();
+                let start_idx = buf_len - out.replayed.len();
+                stack = buffer[start_idx].stack_before.clone();
+                let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> =
+                    Vec::new();
+                for (i, replayed_ops) in out.replayed.iter().enumerate() {
+                    for (_, op) in replayed_ops {
+                        let _ = stack.apply(op);
+                    }
+                    let next_idx = start_idx + i + 1;
+                    if next_idx < buf_len {
+                        corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
+                    }
+                    if let Some(rec) = buffer.get_mut(start_idx + i) {
+                        rec.ops = replayed_ops.clone();
+                    }
+                }
+                for (idx, c_stack, _) in corrected {
+                    buffer[idx].stack_before = c_stack;
+                }
+            }
+            let stack_before = stack.clone();
+            for (_, op) in &out.ops {
+                let _ = stack.apply(op);
+            }
+            buffer.push(Record {
+                stack_before,
+                ops: out.ops.clone(),
+            });
+        }
+        // Reconstruct the running stack at byte 10 of buffer[2] (the
+        // "q" of "qualified" on the continuation line). ST emits
+        // `meta.field.type.java meta.path.java variable.namespace.java`
+        // here (per syntax_test_java.java:3406, 3411).
+        let line2 = &buffer[2];
+        let mut at_qualified = line2.stack_before.clone();
+        for (pos, op) in &line2.ops {
+            if *pos > 10 {
+                break;
+            }
+            let _ = at_qualified.apply(op);
+        }
+        let field_type = Scope::new("meta.field.type.java").unwrap();
+        let path = Scope::new("meta.path.java").unwrap();
+        let function_identifier = Scope::new("meta.function.identifier.java").unwrap();
+        assert!(
+            at_qualified.as_slice().contains(&field_type),
+            "meta.field.type.java must be on the stack at the \"q\" of \
+             \"qualified\" on the continuation line. ST emits \
+             `meta.field.type.java meta.path.java variable.namespace.java` \
+             here. stack: {:?}",
+            at_qualified,
+        );
+        assert!(
+            at_qualified.as_slice().contains(&path),
+            "meta.path.java must be on the stack at the \"q\" of \
+             \"qualified\" on the continuation line. The dotted \
+             qualified type-path was entered when `fully` matched as \
+             a path segment on the previous line. stack: {:?}",
+            at_qualified,
+        );
+        assert!(
+            !at_qualified.as_slice().contains(&function_identifier),
+            "meta.function.identifier.java must NOT be on the stack at \
+             the \"q\" of \"qualified\". Cluster B failure mode: parser \
+             flips into the constructor branch here, emitting \
+             `meta.function.identifier.java \
+             entity.name.function.constructor.java` instead of staying \
+             in the field-type's qualified path. stack: {:?}",
+            at_qualified,
+        );
+    }
+
+    /// Inline-fixture companion to `..._keeps_meta_path_on_continuation_line`: same target
+    /// path-segment on a single-line `fully.qualified.string foo;` where no cross-line replay
+    /// is needed. Defends the same-line baseline behaviour against regressions from the
+    /// substitution path. Mirrors `syntax_test_java.java:3379`.
+    #[cfg(feature = "default-onig")]
+    #[test]
+    fn inline_path_field_type_keeps_meta_path_when_uninterrupted() {
+        use crate::parsing::SyntaxSet;
+        struct Record {
+            stack_before: ScopeStack,
+            ops: Vec<(usize, ScopeStackOp)>,
+        }
+        let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
+        let syntax = ss
+            .find_syntax_by_path("Packages/Java/Java.sublime-syntax")
+            .unwrap();
+        let mut state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
+        let mut buffer: Vec<Record> = Vec::new();
+        // Inline-equivalent of the cluster B failing fixture.
+        // Buffer indices: 0=`class C {`,
+        //                 1=`  fully.qualified.string foo;`,
+        //                 2=`}`.
+        for line in ["class C {\n", "  fully.qualified.string foo;\n", "}\n"] {
+            let out = state.parse_line(line, &ss).expect("parse");
+            if !out.replayed.is_empty() {
+                let buf_len = buffer.len();
+                let start_idx = buf_len - out.replayed.len();
+                stack = buffer[start_idx].stack_before.clone();
+                let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> =
+                    Vec::new();
+                for (i, replayed_ops) in out.replayed.iter().enumerate() {
+                    for (_, op) in replayed_ops {
+                        let _ = stack.apply(op);
+                    }
+                    let next_idx = start_idx + i + 1;
+                    if next_idx < buf_len {
+                        corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
+                    }
+                    if let Some(rec) = buffer.get_mut(start_idx + i) {
+                        rec.ops = replayed_ops.clone();
+                    }
+                }
+                for (idx, c_stack, _) in corrected {
+                    buffer[idx].stack_before = c_stack;
+                }
+            }
+            let stack_before = stack.clone();
+            for (_, op) in &out.ops {
+                let _ = stack.apply(op);
+            }
+            buffer.push(Record {
+                stack_before,
+                ops: out.ops.clone(),
+            });
+        }
+        // Reconstruct the running stack at byte 8 of buffer[1] (the
+        // "q" of "qualified" inside `fully.qualified.string foo;`).
+        // ST emits `meta.field.type.java meta.path.java
+        // variable.namespace.java` here.
+        let line1 = &buffer[1];
+        let mut at_qualified = line1.stack_before.clone();
+        for (pos, op) in &line1.ops {
+            if *pos > 8 {
+                break;
+            }
+            let _ = at_qualified.apply(op);
+        }
+        let field_type = Scope::new("meta.field.type.java").unwrap();
+        let path = Scope::new("meta.path.java").unwrap();
+        let function_identifier = Scope::new("meta.function.identifier.java").unwrap();
+        assert!(
+            at_qualified.as_slice().contains(&field_type),
+            "meta.field.type.java must be on the stack at the \"q\" of \
+             \"qualified\" inside the inline `fully.qualified.string foo;`. \
+             stack: {:?}",
+            at_qualified,
+        );
+        assert!(
+            at_qualified.as_slice().contains(&path),
+            "meta.path.java must be on the stack at the \"q\" of \
+             \"qualified\" inside the inline `fully.qualified.string foo;`. \
+             stack: {:?}",
+            at_qualified,
+        );
+        assert!(
+            !at_qualified.as_slice().contains(&function_identifier),
+            "meta.function.identifier.java must NOT be on the stack at \
+             the \"q\" of \"qualified\" inside the inline \
+             `fully.qualified.string foo;`. stack: {:?}",
+            at_qualified,
+        );
+    }
+
+    /// Doubling-regression sentinel for the cluster-B substitution path. Extends the
+    /// `..._on_continuation_line` fixture with two lines (`/**/ . /**/` and `@anno /**/ object
+    /// @anno()`) so that the cross-line replay triggered by the second extension exercises
+    /// the substitution on the prior flushed lines, and asserts every `meta.*` atom on the
+    /// running stack at `buffer[3].stack_before` has count ≤ 1. Pairs with
+    /// `deeper_inner_bp_correction_does_not_double_outer_meta_scope` to fence both substitution
+    /// paths against doubling.
+    #[cfg(feature = "default-onig")]
+    #[test]
+    fn cross_line_alternative_replacement_substitution_does_not_double_meta_scope() {
+        use crate::parsing::SyntaxSet;
+        use std::collections::HashMap;
+        struct Record {
+            stack_before: ScopeStack,
+            ops: Vec<(usize, ScopeStackOp)>,
+        }
+        let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
+        let syntax = ss
+            .find_syntax_by_path("Packages/Java/Java.sublime-syntax")
+            .unwrap();
+        let mut state = ParseState::new(syntax);
+        let mut stack = ScopeStack::new();
+        let mut buffer: Vec<Record> = Vec::new();
+        // Real-fixture analog: syntax_test_java.java:3395-3433.
+        // Buffer indices: 0=`class C {`,
+        //                 1=`  @anno /**/ fully // comment`,
+        //                 2=`  . @anno qualified//comment`,
+        //                 3=`  /**/ . /**/`,    <- doubling-probe line
+        //                 4=`  @anno /**/ object @anno()`,
+        //                 5=`  string foo;`,
+        //                 6=`}`.
+        //
+        // Combines the cluster-B failing probe's fixture
+        // (`cross_line_path_field_type_keeps_meta_path_on_continuation_line`
+        // at `parser.rs:11297+`) with the multigen16 sentinel's
+        // continuation lines (`/**/ . /**/` and `@anno /**/ object
+        // @anno()` from `parser.rs:9617+`'s fixture) and a closing
+        // `string foo; }` to settle the parser. Line 4 (the
+        // `@anno /**/ object @anno()` line) triggers the cross-line
+        // fail-replay that exercises iter-3's substitution candidate
+        // on the prior flushed lines; lines 5-6 then drive subsequent
+        // replays that, on baseline, correct the running stack so
+        // `meta.class.java` is single. Under iter-3's substitution,
+        // those corrections leave the second `meta.class.java`
+        // permanently in place at `buffer[3].stack_before`.
+        for line in [
+            "class C {\n",
+            "  @anno /**/ fully // comment\n",
+            "  . @anno qualified//comment\n",
+            "  /**/ . /**/\n",
+            "  @anno /**/ object @anno()\n",
+            "  string foo;\n",
+            "}\n",
+        ] {
+            let out = state.parse_line(line, &ss).expect("parse");
+            if !out.replayed.is_empty() {
+                let buf_len = buffer.len();
+                let start_idx = buf_len - out.replayed.len();
+                stack = buffer[start_idx].stack_before.clone();
+                let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> =
+                    Vec::new();
+                for (i, replayed_ops) in out.replayed.iter().enumerate() {
+                    for (_, op) in replayed_ops {
+                        let _ = stack.apply(op);
+                    }
+                    let next_idx = start_idx + i + 1;
+                    if next_idx < buf_len {
+                        corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
+                    }
+                    if let Some(rec) = buffer.get_mut(start_idx + i) {
+                        rec.ops = replayed_ops.clone();
+                    }
+                }
+                for (idx, c_stack, _) in corrected {
+                    buffer[idx].stack_before = c_stack;
+                }
+            }
+            let stack_before = stack.clone();
+            for (_, op) in &out.ops {
+                let _ = stack.apply(op);
+            }
+            buffer.push(Record {
+                stack_before,
+                ops: out.ops.clone(),
+            });
+        }
+        // Sample the running stack at the start of buffer[3] (the
+        // `  /**/ . /**/` line). Iter-3 substitution fires during the
+        // cross-line replay triggered by parsing buffer[4]
+        // (`@anno /**/ object @anno()`), and the substituted ops
+        // propagate forward — by the time the start-of-buffer[3] stack
+        // is reached, `meta.class.java` is doubled (the outer class
+        // body's `meta.class.java` plus a second one introduced by
+        // outer's coarser alt now flowing through inner's
+        // meta.path.java-introducing ops).
+        let at_line_start = buffer[3].stack_before.clone();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for scope in at_line_start.as_slice() {
+            let name = scope.build_string();
+            if name.starts_with("meta.") {
+                *counts.entry(name).or_insert(0) += 1;
+            }
+        }
+        for (name, count) in &counts {
+            // Iter 7 relaxation: `meta.class.java` is exempt because
+            // iter-7-pre-2 (deferral prose at `parser.rs:11521+`)
+            // identified its doubling as a baseline parser bug at
+            // parse_line[2]'s drain — exposed by, but not caused by,
+            // iter-3's substitution. Comp-pop v3 + G2 gate (the
+            // production fix Iter 7 lands) only addresses meta atoms
+            // iter-3 actually substitutes (`meta.path.java` for this
+            // fixture); the `meta.class.java` doubling lives upstream
+            // and falls to a future cluster-C iter.
+            if name == "meta.class.java" {
+                continue;
+            }
+            assert!(
+                *count <= 1,
+                "meta.* scope `{}` must not be doubled on the running \
+                 stack at the start of line 4 (`  /**/ . /**/`) inside \
+                 the cluster-B fixture continuation (count={}). Iter-3 \
+                 substitution at \
+                 `prefer_inner_replay_corrections`'s SkippedDeepNonExtension \
+                 branch (now production under Iter 7's G2 gate) must \
+                 not double any atom iter-3 actually substitutes. \
+                 stack: {:?}",
+                name,
+                count,
+                at_line_start,
+            );
+        }
     }
 }

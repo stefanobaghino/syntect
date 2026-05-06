@@ -75,6 +75,15 @@ pub struct ParseLineOutput {
     pub warnings: Vec<String>,
 }
 
+/// Maximum number of times a zero-width escape match can fire at the
+/// same byte position within a single `parse_line_inner_from` call
+/// before subsequent fires are suppressed (cursor advances one char
+/// without applying the escape). Bounds the unbounded branch-fail
+/// rewind cycle that hangs the parser on Perl POD-embedded language
+/// sections (#650). Threshold is generous to permit legitimate
+/// alt-cycle replays that re-encounter the same offset.
+const ZERO_WIDTH_ESCAPE_FIRE_LIMIT: u32 = 100;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParseState {
     stack: Vec<StateLevel>,
@@ -171,6 +180,19 @@ pub struct ParseState {
     /// at the start of one. Cluster-B candidate-#2 diagnostic
     /// (probe prose at `parser.rs:10767+`).
     inner_replay_max_depth: Option<MaxDepthSeen>,
+    /// Per-line count of zero-width escape fires keyed by byte
+    /// position. Once the count at a position exceeds
+    /// `ZERO_WIDTH_ESCAPE_FIRE_LIMIT`, subsequent zero-width escapes
+    /// at that position are suppressed (cursor advances one char
+    /// without applying the escape, mirroring the would_loop
+    /// enforcement). The threshold is high enough to permit
+    /// legitimate multi-attempt replays through `handle_fail`'s
+    /// alt-cycle and still bound the unbounded branch-fail rewind
+    /// cycle that hangs the parser on Perl POD-embedded sections
+    /// (#650). Cleared per `parse_line_inner_from` invocation, so a
+    /// cross-line replay reprocessing the same line offset starts
+    /// fresh. Intentionally NOT snapshotted into `BranchPoint`.
+    zero_width_escape_fires: HashMap<usize, u32>,
 }
 
 /// Tracker installed on `ParseState` for the duration of an outer
@@ -473,6 +495,7 @@ impl ParseState {
             replay_prefix_ops: None,
             skipped_branches: Vec::new(),
             inner_replay_max_depth: None,
+            zero_width_escape_fires: HashMap::default(),
         }
     }
 
@@ -649,6 +672,12 @@ impl ParseState {
         let mut search_cache: SearchCache = HashMap::with_capacity_and_hasher(128, fnv);
         // Used for detecting loops with push/pop, see long comment above.
         let mut non_consuming_push_at = (0, 0, 0);
+        // Per-iteration zero-width escape fire record (#650). Cleared
+        // here so each `parse_line_inner_from` call (including replays
+        // invoked by `handle_fail`) starts fresh — a legitimate
+        // cross-line replay re-entering the same line offset is not
+        // a loop.
+        self.zero_width_escape_fires.clear();
 
         while self.parse_next_token(
             line,
@@ -704,6 +733,30 @@ impl ParseState {
             // Check if this is an escape match (sentinel pat_index)
             if reg_match.pat_index == usize::MAX {
                 let (match_start, match_end) = reg_match.regions.pos(0).unwrap();
+                let zero_width = match_start == match_end;
+
+                if zero_width
+                    && self
+                        .zero_width_escape_fires
+                        .get(&match_start)
+                        .map(|n| *n >= ZERO_WIDTH_ESCAPE_FIRE_LIMIT)
+                        .unwrap_or(false)
+                {
+                    // Zero-width escape repeatedly firing at the same byte
+                    // within a single `parse_line_inner_from` — diagnostic of
+                    // a branch-fail rewind cycle (#650). Suppress and advance
+                    // one character to break the loop, mirroring the
+                    // `would_loop` enforcement below. Threshold lets
+                    // legitimate alt-cycle replays through `handle_fail`
+                    // re-encounter the same offset without false-tripping.
+                    if let Some((i, _)) = line[*start..].char_indices().nth(1) {
+                        *start += i;
+                        return Ok(true);
+                    } else {
+                        return Ok(false);
+                    }
+                }
+
                 *start = match_end;
                 self.exec_escape(
                     reg_match.escape_index,
@@ -713,6 +766,9 @@ impl ParseState {
                     syntax_set,
                     ops,
                 )?;
+                if zero_width {
+                    *self.zero_width_escape_fires.entry(match_start).or_insert(0) += 1;
+                }
                 search_cache.clear();
                 return Ok(true);
             }
@@ -8621,6 +8677,64 @@ contexts:
             !states2.iter().any(|s| s.contains("keyword.escape")),
             "stale escape must not fire after branch revert, got: {:?}",
             states2
+        );
+    }
+
+    #[test]
+    fn zero_width_escape_at_branch_fail_terminates() {
+        // Sentinel for #650. The unbounded cycle reproduced on
+        // testdata/Packages/Perl/syntax_test_perl.pl (zero-width
+        // POD escape inside embedded JSON/HTML/SQL branch points
+        // wedging the parser for 40+ minutes) only emerges across
+        // multi-line embedded-branch cascades on real fixtures —
+        // single-line synthetic shapes don't trigger it because
+        // escape takes strict precedence and pops the embed on
+        // first hit. This test covers the basic bookkeeping
+        // (per-iteration clear, escape application, threshold
+        // counting) for the embed + zero-width escape + branch
+        // fail combination. The Perl-file syntest run is the
+        // integration witness for the unbounded-cycle fix.
+        let syntax = r#"
+name: ZeroWidthEscapeLoop
+scope: source.zwe
+contexts:
+  main:
+    - match: 'BEGIN'
+      scope: keyword.begin
+      embed: body
+      escape: '(?=END)'
+    - match: '.'
+      scope: main.char
+
+  body:
+    - match: 'X'
+      branch_point: bp
+      branch: [try-fail, fallback]
+    - match: '.'
+      scope: body.char
+
+  try-fail:
+    - match: 'F'
+      fail: bp
+
+  fallback:
+    - match: '\w+'
+      scope: fallback.matched
+"#;
+        let syntax = SyntaxDefinition::load_from_str(syntax, true, None).unwrap();
+        let ss = link(syntax);
+        let mut state = ParseState::new(&ss.syntaxes()[0]);
+
+        // "BEGIN" enters embed. "X" opens branch. "F" fires fail, which
+        // restores the escape_stack snapshot. Position then re-encounters
+        // the zero-width escape lookahead at "END". Without the fix, the
+        // exec_escape ↔ branch-fail cycle does not advance.
+        let out = state.parse_line("BEGINXFEND\n", &ss).expect("parse failed");
+        let states = stack_states(out.ops);
+        assert!(
+            states.iter().any(|s| s.contains("fallback.matched")),
+            "fallback alt should match after escape-induced cycle is broken; got: {:?}",
+            states
         );
     }
 

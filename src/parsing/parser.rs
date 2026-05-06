@@ -1653,21 +1653,9 @@ impl ParseState {
         }
     }
 
-    /// Iter 9 substitution predicate. Position-agnostic widening of
-    /// iter 7's first-diverging-push gate: fires whenever both sides
-    /// have at least one diverging op past the common prefix AND
-    /// `inner_meta_scopes` strictly contains a `meta.*` atom not in
-    /// `outer_meta_scopes`. Subsumes iter 7's case (inner's first
-    /// diverging push IS that meta atom) and adds iter-8 sub-A
-    /// (the missing meta atom appears LATER in the op sequence than
-    /// the first diverging push, e.g. behind a non-meta accessor
-    /// push). Iter-8 sub-B (outer-side over-push) is deferred — the
-    /// symmetric arm fires substitution on slots where inner BPs
-    /// compute ops against a stack base that doesn't align with the
-    /// consumer's running state, producing under-corrected output;
-    /// requires a stack-base alignment discriminator (probe witness:
-    /// `cross_line_path_field_type_recovers_after_object_array_break`,
-    /// currently `#[ignore]`'d through iter 9.5).
+    /// True when both outer and inner have at least one diverging op past their common prefix
+    /// and `inner_meta_scopes` contains a `meta.*` atom not in `outer_meta_scopes`. Used to
+    /// gate the substitution path in `prefer_inner_replay_corrections`.
     fn is_replace_shape(
         outer_div: &Option<OpSummary>,
         inner_div: &Option<OpSummary>,
@@ -1682,12 +1670,10 @@ impl ParseState {
             .any(|s| s.starts_with("meta.") && !outer_meta_scopes.contains(s))
     }
 
-    /// Iter 7 helper. Simulate `ops` on a fresh scope-name stack and
-    /// return the multiset of `meta.*` atoms remaining at end.
-    /// `Push`/`Pop(N)` are simulated literally; other op variants are
-    /// treated as no-ops (they're rare in the substitution shapes
-    /// `is_replace_shape` matches). Used to compute the per-atom net
-    /// push delta between outer and inner ops at the comp-pop site.
+    /// Simulate `ops` on a fresh scope-name stack and return the multiset of `meta.*` atoms
+    /// remaining at the end. `Push`/`Pop(N)` are simulated literally; other op variants are
+    /// treated as no-ops. Used to compute the per-atom net push delta between outer and inner
+    /// ops at the comp-pop site in `prefer_inner_replay_corrections`.
     fn net_meta_delta(ops: &[(usize, ScopeStackOp)]) -> HashMap<String, usize> {
         let mut sim_stack: Vec<String> = Vec::new();
         for (_, op) in ops {
@@ -1729,6 +1715,49 @@ impl ParseState {
         inner[outer.len()..]
             .iter()
             .all(|(pos, op)| *pos <= max_pos && matches!(op, ScopeStackOp::Pop(_)))
+    }
+
+    /// Iter-19 (parser.rs:~12848 prose) discriminator: should cross-line
+    /// `handle_fail` rewind to BP-creation snapshot and force alt 5 on
+    /// re-entry? Composite signal — `class-members` name gate, not-
+    /// already-alt-5 loop guard, empty inner corrections, max-depth BP
+    /// strictly deeper than outer, and the first replayed slot's ops
+    /// contain a Push of `meta.function.return-type.java`. Iter-18's
+    /// per-(`bp_line`, alt) matrix witness: TRUE at row 5 (`@ 3394`
+    /// BENEFICIAL) + 2 safe-neutrals (2976, 2982); FALSE at all 12
+    /// harmful method-decl sites at all alts in `syntax_test_java.java`.
+    fn class_members_alt5_should_rewind(
+        outer_bp_info: &BpInfo,
+        next_alt_index: usize,
+        inner_corrections_empty: bool,
+        inner_replay_max: &MaxDepthSeen,
+        replayed_ops: &[Vec<(usize, ScopeStackOp)>],
+        return_type_scope: Scope,
+    ) -> bool {
+        if outer_bp_info.name != "class-members" {
+            return false;
+        }
+        if next_alt_index >= 5 {
+            return false;
+        }
+        if !inner_corrections_empty {
+            return false;
+        }
+        let max_bp = match inner_replay_max.bp.as_ref() {
+            Some(bp) => bp,
+            None => return false,
+        };
+        if max_bp.stack_depth <= outer_bp_info.stack_depth {
+            return false;
+        }
+        let first_slot = match replayed_ops.first() {
+            Some(slot) => slot,
+            None => return false,
+        };
+        first_slot.iter().any(|(_, op)| match op {
+            ScopeStackOp::Push(s) => return_type_scope.is_prefix_of(*s),
+            _ => false,
+        })
     }
 
     /// Handle a `fail` operation by rewinding to the named branch point.
@@ -2008,8 +2037,8 @@ impl ParseState {
         // it to compute popped-context meta_scope clearance via
         // `push_meta_ops`.
         self.stack = stack_snapshot.clone();
-        self.proto_starts = proto_starts_snapshot;
-        self.escape_stack = escape_stack_snapshot;
+        self.proto_starts = proto_starts_snapshot.clone();
+        self.escape_stack = escape_stack_snapshot.clone();
         self.first_line = first_line_snapshot;
         *non_consuming_push_at = non_consuming_push_at_snapshot;
 
@@ -2129,6 +2158,13 @@ impl ParseState {
             }
             self.stack = post_set_stack;
 
+            // Snapshot the branch_points so the post-replay
+            // `class_members_alt5_should_rewind` discriminator can restore them
+            // for the inline alt-5 re-run below. The captured `next_alternative`
+            // is overwritten to 5 inside the rewind block, so its value here
+            // doesn't matter.
+            let branch_points_snapshot_for_rewind: Vec<BranchPoint> = self.branch_points.clone();
+
             // Save prior flushed_ops state and clear it so any nested
             // cross-line fails firing during the replay loop below write
             // into a clean slot we can detect afterward.
@@ -2186,15 +2222,166 @@ impl ParseState {
             // dotted annotation as `path` alt before the inner
             // `annotation-qualified-identifier` cross-line fail's `name`-alt
             // resolution arrived (during line-2 reparse).
-            let inner_corrections = std::mem::take(&mut self.flushed_ops);
-            let inner_corrections_start = self.flushed_ops_start.take();
-            let inner_corrections_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
+            let mut inner_corrections = std::mem::take(&mut self.flushed_ops);
+            let mut inner_corrections_start = self.flushed_ops_start.take();
+            let mut inner_corrections_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
             self.flushed_ops = saved_flushed;
             self.flushed_ops_start = saved_flushed_start;
             self.flushed_ops_bp_per_slot = saved_flushed_bp;
-            let _inner_replay_max =
+            let mut _inner_replay_max =
                 std::mem::take(&mut self.inner_replay_max_depth).unwrap_or_default();
             self.inner_replay_max_depth = saved_max_depth;
+
+            // Composite-discriminator rewind: when the cross-line `class-members` BP
+            // exhausts an earlier alt without inner corrections and the inner replay reached
+            // a strictly-deeper BP under a `meta.function.return-type.java` push, force alt 5
+            // (`member-maybe-field`) by inlining its setup + replay loop here. The
+            // `next_alt_index < 5` short-circuit inside the discriminator prevents a re-fire
+            // after this block runs. The naive "set `next_alternative = 5` and let the caller
+            // re-trigger" variant doesn't work — the caller's re-parse doesn't re-encounter
+            // the same BP at the same byte position, so the target alt's replay never runs.
+            let return_type_scope =
+                Scope::new("meta.function.return-type.java").expect("well-formed scope");
+            if Self::class_members_alt5_should_rewind(
+                &outer_bp_info,
+                next_alt_index,
+                inner_corrections.is_empty(),
+                &_inner_replay_max,
+                &replayed_ops,
+                return_type_scope,
+            ) {
+                // Restore parser state to BP-creation snapshot. The
+                // `branch_points` snapshot has the BP at next_alternative
+                // = next_alt_index + 1 (post-line-2511 advance); we
+                // overwrite to 6 below to record alt 5 as just tried.
+                self.branch_points = branch_points_snapshot_for_rewind;
+                self.stack = stack_snapshot.clone();
+                self.proto_starts = proto_starts_snapshot.clone();
+                self.escape_stack = escape_stack_snapshot.clone();
+                self.first_line = first_line_snapshot;
+                *non_consuming_push_at = non_consuming_push_at_snapshot;
+
+                // Mirror line ~2511's pattern: advance past alt 5 so a
+                // future fail on this BP goes to the exhaustion path
+                // (alt 5 has been tried by the inline re-run below).
+                self.branch_points[bp_index].next_alternative = 5 + 1;
+
+                // Re-execute the alt-cycle setup for alt 5 (mirrors
+                // lines ~2495-2508 but with alt index 5 instead of N).
+                let next_alt_5 = self.branch_points[bp_index].alternatives[5].clone();
+                if pop_count > 0 {
+                    for _ in 0..pop_count {
+                        self.stack.pop();
+                    }
+                }
+                let with_prototype_5 = self.branch_points[bp_index].with_prototype.clone();
+                let context_id_5 = next_alt_5.id()?;
+                let proto_ids_5 = match with_prototype_5 {
+                    Some(ref p) => vec![p.id()?],
+                    None => Vec::new(),
+                };
+                self.stack.push(StateLevel {
+                    context: context_id_5,
+                    prototypes: proto_ids_5,
+                    captures: None,
+                });
+
+                // Re-build first_line_prefix for alt 5 (mirrors lines
+                // ~2611-2632).
+                let mut first_line_prefix_5 = prefix_ops.clone();
+                let synthetic_op_alt_5 = MatchOperation::Push {
+                    ctx_refs: vec![next_alt_5.clone()],
+                    pop_count,
+                };
+                let level_ctx_id_5 = stack_snapshot.last().map(|l| l.context);
+                let post_set_stack_5 = std::mem::replace(&mut self.stack, stack_snapshot.clone());
+                if let Some(level_ctx_id) = level_ctx_id_5 {
+                    let level_context = syntax_set.get_context(&level_ctx_id)?;
+                    self.push_meta_ops(
+                        true,
+                        trigger_match_start,
+                        level_context,
+                        &synthetic_op_alt_5,
+                        syntax_set,
+                        &mut first_line_prefix_5,
+                    )?;
+                    for scope in &trigger_pat_scope {
+                        first_line_prefix_5.push((trigger_match_start, ScopeStackOp::Push(*scope)));
+                    }
+                    first_line_prefix_5.extend(trigger_capture_ops.iter().cloned());
+                    if !trigger_pat_scope.is_empty() {
+                        first_line_prefix_5
+                            .push((match_start_pos, ScopeStackOp::Pop(trigger_pat_scope.len())));
+                    }
+                    self.push_meta_ops(
+                        false,
+                        match_start_pos,
+                        level_context,
+                        &synthetic_op_alt_5,
+                        syntax_set,
+                        &mut first_line_prefix_5,
+                    )?;
+                }
+                self.stack = post_set_stack_5;
+
+                // Re-run inner replay loop with alt 5 (mirrors lines
+                // ~2649-2693).
+                let saved_flushed_5 = std::mem::take(&mut self.flushed_ops);
+                let saved_flushed_start_5 = self.flushed_ops_start.take();
+                let saved_flushed_bp_5 = std::mem::take(&mut self.flushed_ops_bp_per_slot);
+                let saved_max_depth_5 =
+                    self.inner_replay_max_depth.replace(MaxDepthSeen::default());
+
+                let mut replayed_ops_5: Vec<Vec<(usize, ScopeStackOp)>> =
+                    Vec::with_capacity(truncated_lines.len());
+                for (i, replay_line) in truncated_lines.iter().enumerate() {
+                    let prev_replay_ctx = self.replay_ctx.replace(ReplayCtx {
+                        line_number: bp_line_number + i,
+                        pending_lines_snapshot_offset: pending_lines_snapshot_len + i,
+                    });
+                    let prev_replay_prefix = if i == 0 {
+                        self.replay_prefix_ops.replace(first_line_prefix_5.clone())
+                    } else {
+                        self.replay_prefix_ops.take()
+                    };
+                    let inner_result = if i == 0 {
+                        self.parse_line_inner_from(replay_line, syntax_set, match_start_pos)
+                    } else {
+                        self.parse_line_inner(replay_line, syntax_set)
+                    };
+                    self.replay_ctx = prev_replay_ctx;
+                    self.replay_prefix_ops = prev_replay_prefix;
+                    let tail_ops = inner_result?;
+                    let line_ops = if i == 0 {
+                        let mut first_line_ops = first_line_prefix_5.clone();
+                        first_line_ops.extend(tail_ops);
+                        first_line_ops
+                    } else {
+                        tail_ops
+                    };
+                    replayed_ops_5.push(line_ops);
+                }
+
+                // Capture and restore (mirrors lines ~2705-2713).
+                let inner_corrections_5 = std::mem::take(&mut self.flushed_ops);
+                let inner_corrections_start_5 = self.flushed_ops_start.take();
+                let inner_corrections_bp_5 = std::mem::take(&mut self.flushed_ops_bp_per_slot);
+                self.flushed_ops = saved_flushed_5;
+                self.flushed_ops_start = saved_flushed_start_5;
+                self.flushed_ops_bp_per_slot = saved_flushed_bp_5;
+                let inner_replay_max_5 =
+                    std::mem::take(&mut self.inner_replay_max_depth).unwrap_or_default();
+                self.inner_replay_max_depth = saved_max_depth_5;
+
+                // Reassign outer locals so the merge code below sees
+                // alt 5's results.
+                replayed_ops = replayed_ops_5;
+                inner_corrections = inner_corrections_5;
+                inner_corrections_start = inner_corrections_start_5;
+                inner_corrections_bp = inner_corrections_bp_5;
+                _inner_replay_max = inner_replay_max_5;
+            }
+
             let mut replayed_per_slot_bp: Vec<BpInfo> =
                 vec![outer_bp_info.clone(); replayed_ops.len()];
             if let Some(start) = inner_corrections_start {

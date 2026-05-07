@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use syntect::highlighting::ThemeSet;
 use syntect::io::HighlightedWriter;
 use syntect::parsing::SyntaxSet;
-use syntect::rendering::AnsiStyledOutput;
+use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -36,7 +36,7 @@ fn main() {
                 syntax,
                 &syntax_set,
                 theme,
-                AnsiStyledOutput::new(false),
+                AnsiStyledOutput::new(AnsiBackground::Omit),
             )
             .build();
             io::copy(&mut f, &mut w).unwrap();

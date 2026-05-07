@@ -357,17 +357,18 @@ impl<'a, R: ScopeRenderer, W: io::Write> HighlightedWriter<'a, R, W> {
     fn highlight_line(&mut self, line: &str) -> Result<(), Error> {
         let parse_output = self.parse_state.parse_line(line, self.syntax_set)?;
 
-        // If replayed ops arrived, patch the pending buffer in place. The
-        // parser invariant guarantees `replayed.len() <= pending_ops.len()`,
-        // and `iter_mut().zip(...)` short-circuits at the shorter side, so
-        // no defensive bound check is needed.
+        // If replayed ops arrived, patch the pending buffer in place.
+        // Per `ParseLineOutput::replayed`'s contract, the corrected ops
+        // align with the *last* `replayed.len()` entries of the pending
+        // buffer (`replayed[i] ↔ pending_lines[buf_len - replayed.len() + i]`).
+        // Zipping from index 0 instead would slide ops onto unrelated
+        // line text, panicking later in `render_line` as "byte index N
+        // out of bounds" when an op offset overshoots the misaligned
+        // line.
         if !parse_output.replayed.is_empty() {
-            for (slot, ops) in self
-                .pending_ops
-                .iter_mut()
-                .zip(parse_output.replayed.into_iter())
-            {
-                *slot = ops;
+            let start = self.pending_ops.len() - parse_output.replayed.len();
+            for (i, ops) in parse_output.replayed.into_iter().enumerate() {
+                self.pending_ops[start + i] = ops;
             }
         }
 
@@ -1141,6 +1142,76 @@ contexts:
             .position(|e| matches!(e, MarkupEvent::BeginLine(1)))
             .expect("begin_line(1) missing");
         assert!(pos0 < pos1, "line 0 events must precede line 1 events");
+    }
+
+    #[test]
+    fn replay_window_narrower_than_pending_buffer_aligns_to_last_slots() {
+        // The parser's `ParseLineOutput::replayed` aligns to the *last*
+        // `replayed.len()` entries of the consumer's pending buffer
+        // (`replayed[i] ↔ pending_ops[buf_len - replayed.len() + i]`).
+        // Sliding ops onto the wrong slot panicked TypeScript's
+        // `checker.ts` in `render_line` as "byte index N out of bounds".
+        //
+        // Force `pending_ops.len() > replayed.len()` by opening an outer
+        // BP on line 1 and an inner BP on line 3, then failing the inner
+        // on line 4. Replay covers line 3 only; pending = [L1, L2, L3].
+        // L1 is short and L3 is long, so a slot misalignment lands ops
+        // with offsets past L1's end and panics the byte-index slice.
+        use crate::parsing::{SyntaxDefinition, SyntaxSetBuilder};
+
+        let syntax_str = r#"
+name: NestedBpReplay
+scope: source.nbr
+contexts:
+  main:
+    - match: 'OUTER'
+      branch_point: bp1
+      branch: [outer-a, outer-b]
+  outer-a:
+    - match: '\n'
+    - match: 'INNER'
+      branch_point: bp2
+      branch: [inner-a, inner-b]
+    - match: '(?=NEVERMATCH)'
+      fail: bp1
+    - match: '.'
+      scope: outer.a.char
+  outer-b:
+    - match: '.*'
+      scope: outer.b.fallback
+      pop: true
+  inner-a:
+    - match: '\n'
+    - match: 'KILLBP2'
+      fail: bp2
+    - match: '.'
+      scope: inner.a.text
+  inner-b:
+    - match: '\n'
+    - match: 'KILLBP2'
+      fail: bp2
+    - match: '.'
+      scope: inner.b.text
+"#;
+        let syntax = SyntaxDefinition::load_from_str(syntax_str, true, None).unwrap();
+        let mut builder = SyntaxSetBuilder::new();
+        builder.add(syntax);
+        let ss = builder.build();
+        let syntax_ref = &ss.syntaxes()[0];
+
+        let (capture, _events) = CapturingMarkup::new();
+        let mut w = HighlightedWriter::from_markup(syntax_ref, &ss, capture).build();
+        // L1: "OUTER\n" (6 bytes) opens bp1.
+        // L2: "AB\n"    (3 bytes) ordinary content under outer-a.
+        // L3: long INNER... (>>L1 len) opens bp2 inside outer-a.
+        // L4: "KILLBP2\n" fails bp2 → replayed.len() == 1 covering L3.
+        // Pre-fix the L3 corrected ops slid onto L1's text and tripped
+        // `&line[cur_index..i]` once `i` exceeded L1's 6 bytes.
+        w.write_all(b"OUTER\nAB\nINNERZZZZZZZZZZZZZZZZZZZZZZZZZ\nKILLBP2\n")
+            .unwrap();
+        drop(w);
+        // Reaching here means `flush_pending` rendered every (line, ops)
+        // pair without overflowing the line slice.
     }
 
     #[cfg(all(feature = "default-syntaxes", feature = "html"))]

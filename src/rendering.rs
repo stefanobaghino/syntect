@@ -424,7 +424,7 @@ pub trait StyledOutput {
 /// use syntect::io::HighlightedWriter;
 /// use syntect::highlighting::ThemeSet;
 /// use syntect::parsing::SyntaxSet;
-/// use syntect::rendering::AnsiStyledOutput;
+/// use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
 ///
 /// let ss = SyntaxSet::load_defaults_newlines();
 /// let ts = ThemeSet::load_defaults();
@@ -434,7 +434,7 @@ pub trait StyledOutput {
 ///     syntax,
 ///     &ss,
 ///     &ts.themes["base16-ocean.dark"],
-///     AnsiStyledOutput::new(false),
+///     AnsiStyledOutput::new(AnsiBackground::Omit),
 /// )
 /// .build();
 /// w.write_all(b"fn main() {}\n").unwrap();
@@ -553,43 +553,57 @@ impl<'a, O: StyledOutput> ScopeRenderer for ThemedRenderer<'a, O> {
 // AnsiStyledOutput — 24-bit ANSI colour escapes
 // ---------------------------------------------------------------------------
 
+/// Whether [`AnsiStyledOutput`] emits background-colour escapes.
+///
+/// Used in place of a bare `bool` so call sites read self-evidently
+/// (`AnsiBackground::Include` vs. `AnsiBackground::Omit`).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AnsiBackground {
+    /// Emit the background-colour escape alongside the foreground.
+    Include,
+    /// Emit only the foreground-colour escape.
+    Omit,
+}
+
 /// A [`StyledOutput`] that emits ANSI 24-bit colour escape codes.
 ///
 /// Pair with [`crate::io::HighlightedWriter::from_themed`] (which wraps the
 /// emitter in a [`ThemedRenderer`] for you) to highlight straight to a
-/// terminal. Pass `AnsiStyledOutput::new(false)` for foreground-only output,
-/// or `AnsiStyledOutput::new(true)` to additionally include background
-/// colour escapes.
+/// terminal. Pass `AnsiStyledOutput::new(AnsiBackground::Omit)` for
+/// foreground-only output, or `AnsiStyledOutput::new(AnsiBackground::Include)`
+/// to additionally include background colour escapes.
 ///
-/// Foreground alpha is blended against the background colour. When
-/// `include_bg` is `true`, the background colour escape code is also emitted.
+/// Foreground alpha is blended against the background colour. When the
+/// background is set to [`AnsiBackground::Include`], the background colour
+/// escape code is also emitted.
 ///
 /// `end_style` is intentionally a no-op: the next [`begin_style`] simply
 /// overwrites the active colour with a new escape sequence.
 ///
 /// [`begin_style`]: StyledOutput::begin_style
 pub struct AnsiStyledOutput {
-    include_bg: bool,
+    background: AnsiBackground,
 }
 
 impl AnsiStyledOutput {
     /// Create a new ANSI emitter.
     ///
-    /// If `include_bg` is `true`, the background colour escape code is also
-    /// emitted alongside the foreground.
-    pub fn new(include_bg: bool) -> Self {
-        Self { include_bg }
+    /// Pass [`AnsiBackground::Include`] to emit the background-colour escape
+    /// alongside the foreground, or [`AnsiBackground::Omit`] for
+    /// foreground-only output.
+    pub fn new(background: AnsiBackground) -> Self {
+        Self { background }
     }
 
-    /// Whether background colour escapes are emitted.
-    pub fn include_bg(&self) -> bool {
-        self.include_bg
+    /// Whether background-colour escapes are emitted.
+    pub fn background(&self) -> AnsiBackground {
+        self.background
     }
 }
 
 impl StyledOutput for AnsiStyledOutput {
     fn begin_style(&mut self, style: Style, output: &mut String) {
-        if self.include_bg {
+        if self.background == AnsiBackground::Include {
             write!(
                 output,
                 "\x1b[48;2;{};{};{}m",
@@ -709,12 +723,18 @@ mod tests {
     }
 
     #[test]
-    fn ansi_styled_output_include_bg_accessor_returns_constructor_arg() {
+    fn ansi_styled_output_background_accessor_returns_constructor_arg() {
         // The accessor must round-trip the constructor argument so that
         // callers can introspect whether the emitter is configured to
         // emit background-colour escapes. A constant accessor would
         // erase that distinction.
-        assert!(!AnsiStyledOutput::new(false).include_bg());
-        assert!(AnsiStyledOutput::new(true).include_bg());
+        assert_eq!(
+            AnsiStyledOutput::new(AnsiBackground::Omit).background(),
+            AnsiBackground::Omit
+        );
+        assert_eq!(
+            AnsiStyledOutput::new(AnsiBackground::Include).background(),
+            AnsiBackground::Include
+        );
     }
 }

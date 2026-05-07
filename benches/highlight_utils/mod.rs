@@ -2,7 +2,7 @@ use std::io::Write;
 use syntect::highlighting::Theme;
 use syntect::io::HighlightedWriter;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
-use syntect::rendering::AnsiStyledOutput;
+use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
 
 /// Common helper for benchmarking highlighting.
 pub fn do_highlight(
@@ -11,9 +11,13 @@ pub fn do_highlight(
     syntax: &SyntaxReference,
     theme: &Theme,
 ) -> usize {
-    let mut highlight =
-        HighlightedWriter::from_themed(syntax, syntax_set, theme, AnsiStyledOutput::new(false))
-            .build();
+    let mut highlight = HighlightedWriter::from_themed(
+        syntax,
+        syntax_set,
+        theme,
+        AnsiStyledOutput::new(AnsiBackground::Omit),
+    )
+    .build();
     for line in s.lines() {
         writeln!(highlight, "{}", line).unwrap();
     }

@@ -1142,7 +1142,7 @@ contexts:
         assert!(pos0 < pos1, "line 0 events must precede line 1 events");
     }
 
-    #[cfg(feature = "default-syntaxes")]
+    #[cfg(all(feature = "default-syntaxes", feature = "html"))]
     #[test]
     fn drop_flushes_pending_speculation_buffer() {
         // Variant of `drop_runs_cleanup_when_into_inner_is_skipped` that also
@@ -1233,7 +1233,7 @@ contexts:
         );
     }
 
-    #[cfg(feature = "default-syntaxes")]
+    #[cfg(all(feature = "default-syntaxes", feature = "html"))]
     #[test]
     fn empty_scope_optimisation_truncates_push_pop_with_no_text() {
         // The empty-scope optimisation: when the parser pushes a scope and
@@ -1313,6 +1313,7 @@ contexts:
         );
     }
 
+    #[cfg(feature = "html")]
     #[test]
     fn themed_renderer_closes_styled_span_on_trailing_partial_line() {
         // For a line that ends with a newline, the streaming layer
@@ -1482,7 +1483,7 @@ contexts:
         assert_eq!(flush_count.get(), 2);
     }
 
-    #[cfg(feature = "default-syntaxes")]
+    #[cfg(all(feature = "default-syntaxes", feature = "html"))]
     #[test]
     fn drop_emits_exact_count_of_close_tags_for_open_scopes() {
         // End-of-input cleanup must emit exactly as many close-scope

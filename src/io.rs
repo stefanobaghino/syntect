@@ -91,7 +91,7 @@ use std::io::{self, Write};
 /// use syntect::io::HighlightedWriter;
 /// use syntect::highlighting::ThemeSet;
 /// use syntect::parsing::SyntaxSet;
-/// use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
+/// use syntect::rendering::AnsiStyledOutput;
 ///
 /// let ss = SyntaxSet::load_defaults_newlines();
 /// let ts = ThemeSet::load_defaults();
@@ -102,7 +102,7 @@ use std::io::{self, Write};
 ///     syntax,
 ///     &ss,
 ///     &ts.themes["base16-ocean.dark"],
-///     AnsiStyledOutput::new(AnsiBackground::Omit),
+///     AnsiStyledOutput::Transparent,
 /// )
 /// .with_output(io::stdout().lock())
 /// .build();
@@ -117,7 +117,7 @@ use std::io::{self, Write};
 /// use syntect::io::HighlightedWriter;
 /// use syntect::highlighting::ThemeSet;
 /// use syntect::parsing::SyntaxSet;
-/// use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
+/// use syntect::rendering::AnsiStyledOutput;
 ///
 /// let ss = SyntaxSet::load_defaults_newlines();
 /// let ts = ThemeSet::load_defaults();
@@ -127,7 +127,7 @@ use std::io::{self, Write};
 ///     syntax,
 ///     &ss,
 ///     &ts.themes["base16-ocean.dark"],
-///     AnsiStyledOutput::new(AnsiBackground::Omit),
+///     AnsiStyledOutput::Transparent,
 /// )
 /// .build();
 /// w.write_all(b"fn main() {}\n").unwrap();
@@ -166,7 +166,7 @@ impl<'a> HighlightedWriter<'a> {
     /// [`with_output`] / [`with_state`] before calling [`build`].
     ///
     /// For ANSI 24-bit terminal colours, pass
-    /// `AnsiStyledOutput::new(AnsiBackground::Omit)`.
+    /// [`AnsiStyledOutput::Transparent`] or [`AnsiStyledOutput::Opaque`].
     ///
     /// [`with_output`]: HighlightedWriterBuilder::with_output
     /// [`with_state`]: HighlightedWriterBuilder::with_state
@@ -537,7 +537,7 @@ mod tests {
     use super::*;
     use crate::highlighting::ThemeSet;
     use crate::parsing::SyntaxSet;
-    use crate::rendering::{AnsiBackground, AnsiStyledOutput};
+    use crate::rendering::AnsiStyledOutput;
 
     #[cfg(all(feature = "default-syntaxes", feature = "default-themes"))]
     #[test]
@@ -550,7 +550,7 @@ mod tests {
             syntax,
             &ss,
             &ts.themes["base16-ocean.dark"],
-            AnsiStyledOutput::new(AnsiBackground::Omit),
+            AnsiStyledOutput::Transparent,
         )
         .build();
         w.write_all(b"pub struct Wow { hi: u64 }\n").unwrap();
@@ -570,7 +570,7 @@ mod tests {
             syntax,
             &ss,
             &ts.themes["base16-ocean.dark"],
-            AnsiStyledOutput::new(AnsiBackground::Omit),
+            AnsiStyledOutput::Transparent,
         )
         .build();
         w.write_all(b"fn main() {}\n").unwrap();
@@ -592,7 +592,7 @@ mod tests {
             syntax,
             &ss,
             &ts.themes["base16-ocean.dark"],
-            AnsiStyledOutput::new(AnsiBackground::Omit),
+            AnsiStyledOutput::Transparent,
         )
         .build();
         // Write a line in three chunks, with the newline arriving last.
@@ -618,7 +618,7 @@ mod tests {
             syntax,
             &ss,
             &ts.themes["base16-ocean.dark"],
-            AnsiStyledOutput::new(AnsiBackground::Omit),
+            AnsiStyledOutput::Transparent,
         )
         .build();
         // 'é' is two bytes (0xC3 0xA9). Split between writes.
@@ -638,7 +638,7 @@ mod tests {
             ss.find_syntax_by_extension("py").unwrap(),
             &ss,
             theme,
-            AnsiStyledOutput::new(AnsiBackground::Omit),
+            AnsiStyledOutput::Transparent,
         )
         .build();
 
@@ -653,7 +653,7 @@ mod tests {
             ss.find_syntax_by_extension("py").unwrap(),
             &ss,
             theme,
-            AnsiStyledOutput::new(AnsiBackground::Omit),
+            AnsiStyledOutput::Transparent,
         )
         .with_state(parse_state, scope_stack)
         .build();
@@ -968,13 +968,9 @@ contexts:
             }],
         };
 
-        let mut w = HighlightedWriter::from_themed(
-            syntax_ref,
-            &ss,
-            &theme,
-            AnsiStyledOutput::new(AnsiBackground::Omit),
-        )
-        .build();
+        let mut w =
+            HighlightedWriter::from_themed(syntax_ref, &ss, &theme, AnsiStyledOutput::Transparent)
+                .build();
         w.write_all(b"ping\n").unwrap();
         let output = String::from_utf8(w.into_inner().unwrap()).unwrap();
 
@@ -985,7 +981,7 @@ contexts:
 
     #[test]
     fn ansi_output_with_background_emits_both_escapes() {
-        // Catches AnsiStyledOutput::begin_style with `AnsiBackground::Include` being
+        // Catches AnsiStyledOutput::begin_style with `AnsiStyledOutput::Opaque` being
         // mutated (e.g. swapping the order, dropping one escape, swapping
         // 38/48 codes, channel swaps).
         use crate::highlighting::{
@@ -1032,13 +1028,9 @@ contexts:
             }],
         };
 
-        let mut w = HighlightedWriter::from_themed(
-            syntax_ref,
-            &ss,
-            &theme,
-            AnsiStyledOutput::new(AnsiBackground::Include),
-        )
-        .build();
+        let mut w =
+            HighlightedWriter::from_themed(syntax_ref, &ss, &theme, AnsiStyledOutput::Opaque)
+                .build();
         w.write_all(b"ping\n").unwrap();
         let output = String::from_utf8(w.into_inner().unwrap()).unwrap();
 

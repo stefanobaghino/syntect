@@ -424,7 +424,7 @@ pub trait StyledOutput {
 /// use syntect::io::HighlightedWriter;
 /// use syntect::highlighting::ThemeSet;
 /// use syntect::parsing::SyntaxSet;
-/// use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
+/// use syntect::rendering::AnsiStyledOutput;
 ///
 /// let ss = SyntaxSet::load_defaults_newlines();
 /// let ts = ThemeSet::load_defaults();
@@ -434,7 +434,7 @@ pub trait StyledOutput {
 ///     syntax,
 ///     &ss,
 ///     &ts.themes["base16-ocean.dark"],
-///     AnsiStyledOutput::new(AnsiBackground::Omit),
+///     AnsiStyledOutput::Transparent,
 /// )
 /// .build();
 /// w.write_all(b"fn main() {}\n").unwrap();
@@ -553,57 +553,35 @@ impl<'a, O: StyledOutput> ScopeRenderer for ThemedRenderer<'a, O> {
 // AnsiStyledOutput — 24-bit ANSI colour escapes
 // ---------------------------------------------------------------------------
 
-/// Whether [`AnsiStyledOutput`] emits background-colour escapes.
-///
-/// Used in place of a bare `bool` so call sites read self-evidently
-/// (`AnsiBackground::Include` vs. `AnsiBackground::Omit`).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum AnsiBackground {
-    /// Emit the background-colour escape alongside the foreground.
-    Include,
-    /// Emit only the foreground-colour escape.
-    Omit,
-}
-
 /// A [`StyledOutput`] that emits ANSI 24-bit colour escape codes.
 ///
 /// Pair with [`crate::io::HighlightedWriter::from_themed`] (which wraps the
 /// emitter in a [`ThemedRenderer`] for you) to highlight straight to a
-/// terminal. Pass `AnsiStyledOutput::new(AnsiBackground::Omit)` for
-/// foreground-only output, or `AnsiStyledOutput::new(AnsiBackground::Include)`
-/// to additionally include background colour escapes.
+/// terminal. Pass [`AnsiStyledOutput::Transparent`] for foreground-only
+/// output, or [`AnsiStyledOutput::Opaque`] to additionally include the
+/// background-colour escape so the active theme paints over the terminal's
+/// own background.
 ///
-/// Foreground alpha is blended against the background colour. When the
-/// background is set to [`AnsiBackground::Include`], the background colour
-/// escape code is also emitted.
+/// Foreground alpha is blended against the background colour in both
+/// cases.
 ///
 /// `end_style` is intentionally a no-op: the next [`begin_style`] simply
 /// overwrites the active colour with a new escape sequence.
 ///
 /// [`begin_style`]: StyledOutput::begin_style
-pub struct AnsiStyledOutput {
-    background: AnsiBackground,
-}
-
-impl AnsiStyledOutput {
-    /// Create a new ANSI emitter.
-    ///
-    /// Pass [`AnsiBackground::Include`] to emit the background-colour escape
-    /// alongside the foreground, or [`AnsiBackground::Omit`] for
-    /// foreground-only output.
-    pub fn new(background: AnsiBackground) -> Self {
-        Self { background }
-    }
-
-    /// Whether background-colour escapes are emitted.
-    pub fn background(&self) -> AnsiBackground {
-        self.background
-    }
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AnsiStyledOutput {
+    /// Emit both foreground and background-colour escapes — the theme
+    /// paints over whatever the terminal would otherwise show underneath.
+    Opaque,
+    /// Emit foreground-colour escapes only — the terminal's own
+    /// background shows through.
+    Transparent,
 }
 
 impl StyledOutput for AnsiStyledOutput {
     fn begin_style(&mut self, style: Style, output: &mut String) {
-        if self.background == AnsiBackground::Include {
+        if matches!(self, AnsiStyledOutput::Opaque) {
             write!(
                 output,
                 "\x1b[48;2;{};{};{}m",
@@ -723,18 +701,50 @@ mod tests {
     }
 
     #[test]
-    fn ansi_styled_output_background_accessor_returns_constructor_arg() {
-        // The accessor must round-trip the constructor argument so that
-        // callers can introspect whether the emitter is configured to
-        // emit background-colour escapes. A constant accessor would
-        // erase that distinction.
-        assert_eq!(
-            AnsiStyledOutput::new(AnsiBackground::Omit).background(),
-            AnsiBackground::Omit
+    fn ansi_styled_output_variants_select_distinct_emission_modes() {
+        // `Opaque` must emit a background escape (`\x1b[48;…m`) before the
+        // foreground; `Transparent` must emit only the foreground escape.
+        // A bug that collapsed the two variants into one would either
+        // leak background escapes everywhere or never produce them even
+        // when requested.
+        let style = Style {
+            foreground: Color {
+                r: 11,
+                g: 22,
+                b: 33,
+                a: 0xff,
+            },
+            background: Color {
+                r: 44,
+                g: 55,
+                b: 66,
+                a: 0xff,
+            },
+            font_style: FontStyle::empty(),
+        };
+
+        let mut opaque = AnsiStyledOutput::Opaque;
+        let mut opaque_out = String::new();
+        opaque.begin_style(style, &mut opaque_out);
+        assert!(
+            opaque_out.contains("\x1b[48;2;44;55;66m"),
+            "Opaque must emit background escape, got: {opaque_out:?}"
         );
-        assert_eq!(
-            AnsiStyledOutput::new(AnsiBackground::Include).background(),
-            AnsiBackground::Include
+        assert!(
+            opaque_out.contains("\x1b[38;2;"),
+            "Opaque must still emit foreground escape, got: {opaque_out:?}"
+        );
+
+        let mut transparent = AnsiStyledOutput::Transparent;
+        let mut transparent_out = String::new();
+        transparent.begin_style(style, &mut transparent_out);
+        assert!(
+            !transparent_out.contains("\x1b[48;"),
+            "Transparent must NOT emit background escape, got: {transparent_out:?}"
+        );
+        assert!(
+            transparent_out.contains("\x1b[38;2;"),
+            "Transparent must still emit foreground escape, got: {transparent_out:?}"
         );
     }
 }

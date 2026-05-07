@@ -6,7 +6,7 @@ use syntect::dumps::{dump_to_file, from_dump_file};
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::io::HighlightedWriter;
 use syntect::parsing::SyntaxSet;
-use syntect::rendering::{AnsiBackground, AnsiStyledOutput};
+use syntect::rendering::AnsiStyledOutput;
 
 fn load_theme(tm_file: &str, enable_caching: bool) -> Theme {
     let tm_path = Path::new(tm_file);
@@ -117,14 +117,10 @@ fn main() {
                 .find_syntax_for_file(path)
                 .unwrap()
                 .unwrap_or_else(|| ss.find_syntax_plain_text());
-            let mut highlighter = HighlightedWriter::from_themed(
-                syntax,
-                &ss,
-                &theme,
-                AnsiStyledOutput::new(AnsiBackground::Include),
-            )
-            .with_output(io::stdout().lock())
-            .build();
+            let mut highlighter =
+                HighlightedWriter::from_themed(syntax, &ss, &theme, AnsiStyledOutput::Opaque)
+                    .with_output(io::stdout().lock())
+                    .build();
 
             // HighlightedWriter implements `io::Write`, so we can stream the
             // file straight through it without managing line buffers.

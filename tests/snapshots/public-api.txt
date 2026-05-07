@@ -1378,10 +1378,18 @@ impl core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::SyntaxSetBuil
 impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::SyntaxSetBuilder
 pub const syntect::parsing::ATOM_LEN_BITS: u16
 pub mod syntect::rendering
-pub struct syntect::rendering::AnsiStyledOutput
-impl syntect::rendering::AnsiStyledOutput
-pub fn syntect::rendering::AnsiStyledOutput::include_bg(&self) -> bool
-pub fn syntect::rendering::AnsiStyledOutput::new(include_bg: bool) -> Self
+pub enum syntect::rendering::AnsiStyledOutput
+pub syntect::rendering::AnsiStyledOutput::Opaque
+pub syntect::rendering::AnsiStyledOutput::Transparent
+impl core::clone::Clone for syntect::rendering::AnsiStyledOutput
+pub fn syntect::rendering::AnsiStyledOutput::clone(&self) -> syntect::rendering::AnsiStyledOutput
+impl core::cmp::Eq for syntect::rendering::AnsiStyledOutput
+impl core::cmp::PartialEq for syntect::rendering::AnsiStyledOutput
+pub fn syntect::rendering::AnsiStyledOutput::eq(&self, other: &syntect::rendering::AnsiStyledOutput) -> bool
+impl core::fmt::Debug for syntect::rendering::AnsiStyledOutput
+pub fn syntect::rendering::AnsiStyledOutput::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for syntect::rendering::AnsiStyledOutput
+impl core::marker::StructuralPartialEq for syntect::rendering::AnsiStyledOutput
 impl syntect::rendering::StyledOutput for syntect::rendering::AnsiStyledOutput
 pub fn syntect::rendering::AnsiStyledOutput::begin_style(&mut self, style: syntect::highlighting::Style, output: &mut alloc::string::String)
 pub fn syntect::rendering::AnsiStyledOutput::end_style(&mut self, _output: &mut alloc::string::String)

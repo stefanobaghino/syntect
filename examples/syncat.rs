@@ -118,7 +118,7 @@ fn main() {
                 .unwrap()
                 .unwrap_or_else(|| ss.find_syntax_plain_text());
             let mut highlighter =
-                HighlightedWriter::from_themed(syntax, &ss, &theme, AnsiStyledOutput::new(false))
+                HighlightedWriter::from_themed(syntax, &ss, &theme, AnsiStyledOutput::new(true))
                     .with_output(io::stdout().lock())
                     .build();
 

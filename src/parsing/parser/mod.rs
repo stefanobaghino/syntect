@@ -108,29 +108,35 @@ struct Core {
 pub struct ParseState {
     core: Core,
     /// Active branch points for backtracking support.
+    #[cfg(not(feature = "trail-engine"))]
     branch_points: Vec<BranchPoint>,
     /// Line strings buffered while branch points are active, for potential
     /// cross-line `fail` replay. Only the strings are stored; the ops are
     /// returned to callers immediately (same as before).
+    #[cfg(not(feature = "trail-engine"))]
     pending_lines: Vec<String>,
     /// Snapshot of `shadow` at the start of each buffered line in
     /// `pending_lines`. Used by the cross-line-fail replay to restore
     /// `shadow` to its state at the first replayed line's beginning, so
     /// the shadow mirrors what the consumer does (reset + apply
     /// replayed).
+    #[cfg(not(feature = "trail-engine"))]
     pending_line_start_shadows: Vec<ScopeStack>,
     /// Corrected ops produced by a cross-line `fail` replay, to be returned
     /// as `ParseLineOutput::replayed` at the end of `parse_line`. When
     /// populated, entry `i` corresponds to `pending_lines[flushed_ops_start + i]`.
+    #[cfg(not(feature = "trail-engine"))]
     flushed_ops: Vec<Vec<(usize, ScopeStackOp)>>,
     /// Pending-lines index that `flushed_ops[0]` maps to when `flushed_ops`
     /// is non-empty. Reset to `None` between `parse_line` calls.
+    #[cfg(not(feature = "trail-engine"))]
     flushed_ops_start: Option<usize>,
     /// Identity of the branch point whose cross-line replay wrote each
     /// slot of `flushed_ops`. Indexed identically to `flushed_ops`
     /// (length always matches). Each slot remembers the BP whose replay
     /// produced its current ops, so subsequent merges can compare
     /// per-slot rather than per-buffer.
+    #[cfg(not(feature = "trail-engine"))]
     flushed_ops_bp_per_slot: Vec<BpInfo>,
     /// Warnings accumulated during parsing, drained into `ParseLineOutput`.
     warnings: Vec<String>,
@@ -144,6 +150,7 @@ pub struct ParseState {
     /// `self.core.stack` (the Push for the atom is committed in
     /// `flushed_ops`, so it can't be taken back by `ops.truncate`) —
     /// and emits a balancing Pop before the normal escape pops.
+    #[cfg(not(feature = "trail-engine"))]
     shadow: ScopeStack,
     /// Active while `handle_fail` recurses into `parse_line_inner*` to
     /// replay a buffered past line under a new alternative. Overrides
@@ -155,6 +162,7 @@ pub struct ParseState {
     /// its replay-line-relative `match_start` to a shorter outer line
     /// (the byte-20-out-of-13 panic on `syntax_test_java.java:10263`
     /// inside `@MultiLineAnnotation(...)`).
+    #[cfg(not(feature = "trail-engine"))]
     replay_ctx: Option<ReplayCtx>,
     /// Ops the outer cross-line replay has already composed for the
     /// first replayed line — outer prefix_ops + new-alt meta/pat/capture
@@ -167,6 +175,7 @@ pub struct ParseState {
     /// where `link-def-title-continuation`'s fail spawns a nested
     /// `link-def-attr-continuation` whose own fail then replayed line 3
     /// without the original captures.
+    #[cfg(not(feature = "trail-engine"))]
     replay_prefix_ops: Option<Vec<(usize, ScopeStackOp)>>,
     /// Branch_points whose alternatives have all been exhausted at a
     /// specific cursor position on the current line. Subsequent
@@ -190,6 +199,7 @@ pub struct ParseState {
     /// at the start of one. Cluster-B candidate-#2 diagnostic
     /// (probe assertions in
     /// `cross_line_path_field_type_keeps_meta_path_on_continuation_line`).
+    #[cfg(not(feature = "trail-engine"))]
     inner_replay_max_depth: Option<MaxDepthSeen>,
     /// Per-line count of zero-width escape fires keyed by byte
     /// position. Once the count at a position exceeds
@@ -213,6 +223,7 @@ pub struct ParseState {
 /// Tracker installed on `ParseState` for the duration of an outer
 /// `handle_fail`'s inner replay. Records the strictly-deepest
 /// `branch_point` created while the replay loop runs.
+#[cfg(not(feature = "trail-engine"))]
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct MaxDepthSeen {
     depth: usize,
@@ -221,6 +232,7 @@ struct MaxDepthSeen {
 
 /// Compact summary of a `(byte_offset, ScopeStackOp)` pair returned by
 /// `ops_divergence` for use by `is_replace_shape`.
+#[cfg(not(feature = "trail-engine"))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[allow(dead_code)]
 struct OpSummary {
@@ -233,6 +245,7 @@ struct OpSummary {
 /// `flushed_ops`. Captured so `prefer_inner_replay_corrections` can
 /// compare the inner BP (whose corrections are candidate replacements)
 /// against the outer BP (whose locally-computed replay is the default).
+#[cfg(not(feature = "trail-engine"))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct BpInfo {
     name: String,
@@ -254,6 +267,7 @@ struct BpInfo {
 
 /// Bookkeeping override used while `handle_fail` is re-parsing a
 /// buffered past line. See the `replay_ctx` field on `ParseState`.
+#[cfg(not(feature = "trail-engine"))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ReplayCtx {
     /// Virtual "current line" of the inner re-parse (`bp.line_number + i`).
@@ -277,6 +291,7 @@ struct EscapeEntry {
 }
 
 /// Snapshot of parser state at a branch point, used for backtracking.
+#[cfg(not(feature = "trail-engine"))]
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct BranchPoint {
     name: String,
@@ -354,12 +369,13 @@ type SearchCache = HashMap<*const MatchPattern, Option<Region>, BuildHasherDefau
 mod core;
 mod embed;
 mod semantics;
+#[cfg(not(feature = "trail-engine"))]
 mod speculation;
-#[cfg(feature = "trail-engine")]
-mod trail;
 #[cfg(feature = "yaml-load")]
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "trail-engine")]
+mod trail;
 
 impl ParseState {
     /// Creates a state from a syntax definition, keeping its own reference-counted point to the
@@ -378,17 +394,27 @@ impl ParseState {
                 line_number: 0,
                 escape_stack: Vec::new(),
             },
+            #[cfg(not(feature = "trail-engine"))]
             branch_points: Vec::new(),
+            #[cfg(not(feature = "trail-engine"))]
             pending_lines: Vec::new(),
+            #[cfg(not(feature = "trail-engine"))]
             pending_line_start_shadows: Vec::new(),
+            #[cfg(not(feature = "trail-engine"))]
             flushed_ops: Vec::new(),
+            #[cfg(not(feature = "trail-engine"))]
             flushed_ops_start: None,
+            #[cfg(not(feature = "trail-engine"))]
             flushed_ops_bp_per_slot: Vec::new(),
             warnings: Vec::new(),
+            #[cfg(not(feature = "trail-engine"))]
             shadow: ScopeStack::new(),
+            #[cfg(not(feature = "trail-engine"))]
             replay_ctx: None,
+            #[cfg(not(feature = "trail-engine"))]
             replay_prefix_ops: None,
             skipped_branches: Vec::new(),
+            #[cfg(not(feature = "trail-engine"))]
             inner_replay_max_depth: None,
             zero_width_escape_fires: HashMap::default(),
             #[cfg(feature = "trail-engine")]
@@ -415,6 +441,7 @@ impl ParseState {
     /// [`ScopeStack::apply`]: struct.ScopeStack.html#method.apply
     /// [`SyntaxSet`]: struct.SyntaxSet.html
     /// [`ParseState`]: struct.ParseState.html
+    #[cfg(not(feature = "trail-engine"))]
     pub fn parse_line(
         &mut self,
         line: &str,
@@ -523,6 +550,7 @@ impl ParseState {
     /// result of `parse_line` may be revised by a future `fail` action.
     /// Once the branch resolves (or if no branch was entered), this returns
     /// `false` and all ops emitted so far are final.
+    #[cfg(not(feature = "trail-engine"))]
     pub fn is_speculative(&self) -> bool {
         !self.branch_points.is_empty()
     }
@@ -531,6 +559,7 @@ impl ParseState {
     /// returns the scope-stack operations.  Does **not** touch `pending_lines`
     /// or `flushed_ops`, so it is safe to call recursively from `handle_fail`
     /// for cross-line replay without re-entrancy issues.
+    #[cfg(not(feature = "trail-engine"))]
     fn parse_line_inner(
         &mut self,
         line: &str,
@@ -546,6 +575,7 @@ impl ParseState {
     /// When `start_at > 0` the `first_line` bookkeeping is skipped — the
     /// caller has already emitted (or preserved) the initial
     /// meta_content_scope push.
+    #[cfg(not(feature = "trail-engine"))]
     fn parse_line_inner_from(
         &mut self,
         line: &str,

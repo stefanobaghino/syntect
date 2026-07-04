@@ -226,6 +226,35 @@ impl ParseState {
                 );
             }
 
+            // Trail engine: a branch trigger consults or extends the
+            // decision trail before anything is emitted or consumed, so
+            // a `Refuse` decision can suppress the pattern entirely and
+            // a restart can resume from this exact point.
+            #[cfg(feature = "trail-engine")]
+            if let MatchOperation::Branch {
+                ref name,
+                ref alternatives,
+                pop_count,
+            } = match_pattern.operation
+            {
+                match self.decide_branch(
+                    name,
+                    alternatives.len(),
+                    pop_count,
+                    *start,
+                    ops.len(),
+                    *non_consuming_push_at,
+                ) {
+                    Some(alt) => self.set_pending_alt(alt),
+                    None => {
+                        // Refused: re-search at the same cursor with the
+                        // branch pattern suppressed, so the parent
+                        // context's next rule gets a chance.
+                        return Ok(true);
+                    }
+                }
+            }
+
             let consuming = match_end > *start;
             if !consuming {
                 // The match doesn't consume any characters. If this is a
@@ -261,6 +290,7 @@ impl ParseState {
                 // inside link-title-continuation's exhaustion replay, then
                 // collapsing `meta.link.reference.def.markdown` on the empty
                 // line.
+                #[cfg(not(feature = "trail-engine"))]
                 if matches!(match_pattern.operation, MatchOperation::Branch { .. })
                     && self.replay_ctx.is_some()
                     && match_end >= line.len()
@@ -593,8 +623,14 @@ impl ParseState {
         let context = reg_match.context;
         let pat = context.match_at(reg_match.pat_index)?;
 
+        // The trail engine's fail path doesn't rewind in place, so the
+        // executor-local cursor state stays untouched here.
+        #[cfg(feature = "trail-engine")]
+        let _ = (&start, &non_consuming_push_at, &search_cache);
+
         // Handle Fail: attempt backtracking
         if let MatchOperation::Fail(ref name) = pat.operation {
+            #[cfg(not(feature = "trail-engine"))]
             return self.handle_fail(
                 name,
                 line,
@@ -604,6 +640,13 @@ impl ParseState {
                 search_cache,
                 syntax_set,
             );
+            #[cfg(feature = "trail-engine")]
+            {
+                // Whether the fail scheduled a restart or was a no-op,
+                // stop the token loop; the window driver takes over.
+                self.fail_branch(name);
+                return Ok(false);
+            }
         }
 
         // For Branch, we need to snapshot state before executing, then synthesize a Push.
@@ -617,82 +660,96 @@ impl ParseState {
                 pop_count,
             } = pat.operation
             {
-                // Snapshot current state.
-                //
-                // NOTE on field naming: `match_start` here stores the
-                // position the parser should *resume* from on fail —
-                // which is the branch match's end position (since the
-                // parser has already consumed the match). `match_end`
-                // and `pat_scope` carry the *real* match span plus the
-                // keyword's own scopes so a same-line fail rewind can
-                // re-emit them (they were truncated off `ops` along
-                // with the alt[0]'s subsequent work).
-                // When `handle_fail` is mid-replay, `self.core.line_number` /
-                // `self.pending_lines` still reflect the *outer* current
-                // line — read through `replay_ctx` so a branch born
-                // during replay anchors to the virtual replay line `L+i`.
-                let (bp_line_number, bp_pending_lines_snapshot_len) = match &self.replay_ctx {
-                    Some(ctx) => (ctx.line_number, ctx.pending_lines_snapshot_offset),
-                    None => (
-                        self.core.line_number.saturating_sub(1),
-                        self.pending_lines.len(),
-                    ),
+                // Trail engine: the alternative was chosen by
+                // `decide_branch` in `parse_next_token`; no snapshot is
+                // taken here — the decision's checkpoint carries it.
+                #[cfg(feature = "trail-engine")]
+                let chosen_alt = {
+                    let _ = name;
+                    self.take_pending_alt()
+                        .expect("branch reached exec_pattern without a trail decision")
                 };
-                // When this branch is born inside an outer cross-line
-                // replay's `parse_line_inner_from`, the local `ops` Vec
-                // is the inner re-parse's `res` — it does *not* include
-                // the outer prefix the outer replay is about to splice
-                // in front. Without prepending that outer prefix, a
-                // later fail of *this* branch reconstructs its line
-                // from an empty prefix, dropping the outer captures
-                // entirely (the `[foo]:` LRD opener vanished from
-                // `syntax_test_markdown.md`'s `[foo]: /url` cases when
-                // a `link-def-attr-continuation` born inside the
-                // `link-def-title-continuation` replay later failed).
-                let prefix_ops = match &self.replay_prefix_ops {
-                    Some(outer) => {
-                        let mut combined = outer.clone();
-                        combined.extend(ops.iter().cloned());
-                        combined
-                    }
-                    None => ops.clone(),
-                };
-                let bp = BranchPoint {
-                    name: name.clone(),
-                    next_alternative: 1, // 0 is about to be pushed
-                    alternatives: alternatives.clone(),
-                    stack_snapshot: self.core.stack.clone(),
-                    proto_starts_snapshot: self.core.proto_starts.clone(),
-                    match_start: *start, // position before this match's advance
-                    trigger_match_start: match_start,
-                    pat_scope: pat.scope.clone(),
-                    line_number: bp_line_number,
-                    ops_snapshot_len: ops.len(),
-                    stack_depth: self.core.stack.len(),
-                    non_consuming_push_at_snapshot: *non_consuming_push_at,
-                    first_line_snapshot: self.core.first_line,
-                    with_prototype: pat.with_prototype.clone(),
-                    pending_lines_snapshot_len: bp_pending_lines_snapshot_len,
-                    escape_stack_snapshot: self.core.escape_stack.clone(),
-                    pop_count,
-                    prefix_ops,
-                    capture_ops: pat
-                        .captures
-                        .as_ref()
-                        .map(|m| build_capture_ops(m, &reg_match.regions))
-                        .unwrap_or_default(),
-                };
-                self.branch_points.push(bp);
-                if let Some(tracker) = self.inner_replay_max_depth.as_mut() {
-                    let last = self.branch_points.last().unwrap();
-                    if last.stack_depth > tracker.depth {
-                        tracker.depth = last.stack_depth;
-                        tracker.bp = Some(BpInfo {
-                            name: last.name.clone(),
-                            stack_depth: last.stack_depth,
-                            line_number: last.line_number,
-                            inner_producer: None,
-                        });
+                #[cfg(not(feature = "trail-engine"))]
+                let chosen_alt = 0;
+                #[cfg(not(feature = "trail-engine"))]
+                {
+                    // Snapshot current state.
+                    //
+                    // NOTE on field naming: `match_start` here stores the
+                    // position the parser should *resume* from on fail —
+                    // which is the branch match's end position (since the
+                    // parser has already consumed the match). `match_end`
+                    // and `pat_scope` carry the *real* match span plus the
+                    // keyword's own scopes so a same-line fail rewind can
+                    // re-emit them (they were truncated off `ops` along
+                    // with the alt[0]'s subsequent work).
+                    // When `handle_fail` is mid-replay, `self.core.line_number` /
+                    // `self.pending_lines` still reflect the *outer* current
+                    // line — read through `replay_ctx` so a branch born
+                    // during replay anchors to the virtual replay line `L+i`.
+                    let (bp_line_number, bp_pending_lines_snapshot_len) = match &self.replay_ctx {
+                        Some(ctx) => (ctx.line_number, ctx.pending_lines_snapshot_offset),
+                        None => (
+                            self.core.line_number.saturating_sub(1),
+                            self.pending_lines.len(),
+                        ),
+                    };
+                    // When this branch is born inside an outer cross-line
+                    // replay's `parse_line_inner_from`, the local `ops` Vec
+                    // is the inner re-parse's `res` — it does *not* include
+                    // the outer prefix the outer replay is about to splice
+                    // in front. Without prepending that outer prefix, a
+                    // later fail of *this* branch reconstructs its line
+                    // from an empty prefix, dropping the outer captures
+                    // entirely (the `[foo]:` LRD opener vanished from
+                    // `syntax_test_markdown.md`'s `[foo]: /url` cases when
+                    // a `link-def-attr-continuation` born inside the
+                    // `link-def-title-continuation` replay later failed).
+                    let prefix_ops = match &self.replay_prefix_ops {
+                        Some(outer) => {
+                            let mut combined = outer.clone();
+                            combined.extend(ops.iter().cloned());
+                            combined
+                        }
+                        None => ops.clone(),
+                    };
+                    let bp = BranchPoint {
+                        name: name.clone(),
+                        next_alternative: 1, // 0 is about to be pushed
+                        alternatives: alternatives.clone(),
+                        stack_snapshot: self.core.stack.clone(),
+                        proto_starts_snapshot: self.core.proto_starts.clone(),
+                        match_start: *start, // position before this match's advance
+                        trigger_match_start: match_start,
+                        pat_scope: pat.scope.clone(),
+                        line_number: bp_line_number,
+                        ops_snapshot_len: ops.len(),
+                        stack_depth: self.core.stack.len(),
+                        non_consuming_push_at_snapshot: *non_consuming_push_at,
+                        first_line_snapshot: self.core.first_line,
+                        with_prototype: pat.with_prototype.clone(),
+                        pending_lines_snapshot_len: bp_pending_lines_snapshot_len,
+                        escape_stack_snapshot: self.core.escape_stack.clone(),
+                        pop_count,
+                        prefix_ops,
+                        capture_ops: pat
+                            .captures
+                            .as_ref()
+                            .map(|m| build_capture_ops(m, &reg_match.regions))
+                            .unwrap_or_default(),
+                    };
+                    self.branch_points.push(bp);
+                    if let Some(tracker) = self.inner_replay_max_depth.as_mut() {
+                        let last = self.branch_points.last().unwrap();
+                        if last.stack_depth > tracker.depth {
+                            tracker.depth = last.stack_depth;
+                            tracker.bp = Some(BpInfo {
+                                name: last.name.clone(),
+                                stack_depth: last.stack_depth,
+                                line_number: last.line_number,
+                                inner_producer: None,
+                            });
+                        }
                     }
                 }
                 // `pop: N + branch:` is **lookahead** per ST: the trigger
@@ -702,7 +759,7 @@ impl ParseState {
                 // `perform_op` handles both the deeper-pop emission and
                 // the runtime stack mutation.
                 synthetic_op = MatchOperation::Push {
-                    ctx_refs: vec![alternatives[0].clone()],
+                    ctx_refs: vec![alternatives[chosen_alt].clone()],
                     pop_count,
                 };
             } else {

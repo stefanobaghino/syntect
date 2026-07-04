@@ -739,6 +739,9 @@ fn pop_n_branch_point_keeps_bp_so_alt_fail_unwinds_meta_scope() {
              into the outer extends path; final stack: {:?}",
         stack,
     );
+    // The shadow stack is a legacy-engine internal (the trail engine
+    // has no consumer mirror to drift).
+    #[cfg(not(feature = "trail-engine"))]
     assert!(
         !state.shadow.as_slice().contains(&ann),
         "syntect shadow still carries meta.annotation.identifier.java; \

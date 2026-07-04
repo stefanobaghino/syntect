@@ -29,35 +29,32 @@ impl ParseState {
         // because a speculative `meta.path.java` atom pushed inside the
         // embedded Java shifts every subsequent Pop by one.
         //
-        // `shadow` mirrors what the consumer will actually hold at this
-        // point: end-of-prior-line shadow + ops-so-far on the current
-        // line. `expected_depth` is what the consumer *should* have
-        // based on `self.core.stack`'s meta_scope / meta_content_scope
-        // contributions (with the v2 `embed_scope_replaces` mcs gating
-        // applied below, matching the pop loop).
-        let mut current_shadow = self.shadow.clone();
-        for (_, op) in ops.iter() {
-            let _ = current_shadow.apply(op);
-        }
-        let consumer_depth = current_shadow.as_slice().len();
-        let expected_depth: usize = {
-            let mut total = 0usize;
-            let mut prev_embed_scope_replaces = false;
-            for lvl in &self.core.stack {
-                let ctx = syntax_set.get_context(&lvl.context)?;
-                total += ctx.meta_scope.len();
-                if !prev_embed_scope_replaces {
-                    total += ctx.meta_content_scope.len();
-                }
-                prev_embed_scope_replaces = ctx.embed_scope_replaces;
+        #[cfg(not(feature = "trail-engine"))]
+        {
+            let mut current_shadow = self.shadow.clone();
+            for (_, op) in ops.iter() {
+                let _ = current_shadow.apply(op);
             }
-            total
-        };
-        if consumer_depth > expected_depth {
-            ops.push((
-                match_start,
-                ScopeStackOp::Pop(consumer_depth - expected_depth),
-            ));
+            let consumer_depth = current_shadow.as_slice().len();
+            let expected_depth: usize = {
+                let mut total = 0usize;
+                let mut prev_embed_scope_replaces = false;
+                for lvl in &self.core.stack {
+                    let ctx = syntax_set.get_context(&lvl.context)?;
+                    total += ctx.meta_scope.len();
+                    if !prev_embed_scope_replaces {
+                        total += ctx.meta_content_scope.len();
+                    }
+                    prev_embed_scope_replaces = ctx.embed_scope_replaces;
+                }
+                total
+            };
+            if consumer_depth > expected_depth {
+                ops.push((
+                    match_start,
+                    ScopeStackOp::Pop(consumer_depth - expected_depth),
+                ));
+            }
         }
 
         // Pop all stack levels down to target_depth, emitting proper meta scope pops
@@ -131,9 +128,14 @@ impl ParseState {
         // the Push/Set/Embed/Pop retain calls): subtracting the bp's own
         // pop_count is necessary so a `pop: N + branch_point` whose
         // snapshot captures the pre-pop depth doesn't false-prune itself.
-        let stack_len = self.core.stack.len();
-        self.branch_points
-            .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
+        // (Trail engine: the post-token `prune_dead_branches` hook covers
+        // this site.)
+        #[cfg(not(feature = "trail-engine"))]
+        {
+            let stack_len = self.core.stack.len();
+            self.branch_points
+                .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
+        }
 
         Ok(())
     }

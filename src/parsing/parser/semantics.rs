@@ -878,6 +878,7 @@ impl ParseState {
                 };
                 if pop_count > 0 {
                     let final_len = self.core.stack.len() + ctx_refs.len();
+                    #[cfg(not(feature = "trail-engine"))]
                     self.branch_points
                         .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
                     self.core.escape_stack.retain(|e| e.stack_depth < final_len);
@@ -894,6 +895,7 @@ impl ParseState {
                         self.core.stack.pop();
                     }
                     let stack_len = self.core.stack.len();
+                    #[cfg(not(feature = "trail-engine"))]
                     self.branch_points
                         .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
                     self.core.escape_stack.retain(|e| e.stack_depth < stack_len);
@@ -932,6 +934,7 @@ impl ParseState {
                 // `meta.annotation.identifier.java meta.path.java` past
                 // every nested-annotation extends path.
                 let final_len = self.core.stack.len() + ctx_refs.len();
+                #[cfg(not(feature = "trail-engine"))]
                 self.branch_points
                     .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
                 self.core.escape_stack.retain(|e| e.stack_depth < final_len);
@@ -945,6 +948,7 @@ impl ParseState {
                 // the stack. Use the same threshold as `handle_fail`'s
                 // validity check — see the comment in the Set arm above.
                 let stack_len = self.core.stack.len();
+                #[cfg(not(feature = "trail-engine"))]
                 self.branch_points
                     .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
                 // Remove escape entries whose stack_depth >= current stack

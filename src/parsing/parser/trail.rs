@@ -121,3 +121,335 @@ pub(super) struct TrailState {
     /// Restarts consumed by the current `parse_line` call.
     restarts: usize,
 }
+
+impl ParseState {
+    /// Parses a single line of the file. See the legacy engine's
+    /// documentation in `mod.rs` for the general contract; the trail
+    /// engine differs only in how `branch_point`/`fail` backtracking is
+    /// implemented (checkpointed re-execution of the buffered window
+    /// instead of surgical correction of already-emitted ops). The
+    /// `ParseLineOutput` contract is unchanged: `replayed` carries the
+    /// corrected ops for the last `replayed.len()` lines before this one
+    /// whenever a cross-line restart revised them.
+    pub fn parse_line(
+        &mut self,
+        line: &str,
+        syntax_set: &SyntaxSet,
+    ) -> Result<ParseLineOutput, ParsingError> {
+        if self.core.stack.is_empty() {
+            return Err(ParsingError::MissingMainContext);
+        }
+
+        // Skipped-branch entries are tied to byte offsets within a single
+        // line — they don't survive across line boundaries.
+        self.skipped_branches.clear();
+
+        // Decisions older than 128 lines can no longer be rewound to:
+        // finalize them.
+        let cur_line = self.core.line_number;
+        let warnings = &mut self.warnings;
+        self.trail.live.retain(|b| {
+            let alive = cur_line.saturating_sub(b.created_line) <= 128;
+            if !alive {
+                warnings.push(format!(
+                    "branch point '{}' expired (exceeded 128-line rewind limit)",
+                    b.name
+                ));
+            }
+            alive
+        });
+        self.core.line_number += 1;
+        let line_number_after = self.core.line_number;
+
+        // No live decisions means no future `fail` can revise the
+        // window: commit it and start a fresh one at the current line.
+        if self.trail.live.is_empty() {
+            self.trail.lines.clear();
+            self.trail.provisional.clear();
+            self.trail.trail.clear();
+            self.trail.base_line = cur_line;
+        }
+        self.trail.cursor = self.trail.trail.len();
+        self.trail.restarts = 0;
+
+        self.trail.lines.push(line.to_owned());
+        self.trail.provisional.push(Vec::new());
+        let cur_idx = self.trail.lines.len() - 1;
+        let mut min_rewind = cur_idx;
+
+        let mut from_line = cur_idx;
+        let mut from_pos = 0usize;
+        let mut from_ncpa = (0usize, 0usize, 0usize);
+
+        loop {
+            self.execute_window(from_line, from_pos, from_ncpa, syntax_set)?;
+            let Some(idx) = self.trail.pending_backtrack.take() else {
+                break;
+            };
+            let ck = self.trail.trail[idx].checkpoint.clone();
+            self.core = ck.core;
+            self.trail.live = ck.live;
+            self.skipped_branches = ck.skipped_branches;
+            self.trail.provisional[ck.line_idx].truncate(ck.ops_len);
+            for slot in &mut self.trail.provisional[ck.line_idx + 1..] {
+                slot.clear();
+            }
+            min_rewind = min_rewind.min(ck.line_idx);
+            from_line = ck.line_idx;
+            from_pos = ck.pos;
+            from_ncpa = ck.non_consuming_push_at;
+        }
+
+        // Mid-window checkpoints carry the line counter of their
+        // creation call; the lines-fed count must survive restores.
+        self.core.line_number = line_number_after;
+
+        let ops = self.trail.provisional[cur_idx].clone();
+        let replayed = if min_rewind < cur_idx {
+            self.trail.provisional[min_rewind..cur_idx].to_vec()
+        } else {
+            Vec::new()
+        };
+        let warnings = std::mem::take(&mut self.warnings);
+
+        Ok(ParseLineOutput {
+            ops,
+            replayed,
+            warnings,
+        })
+    }
+
+    /// Returns `true` when the parser is inside a `branch_point` and the
+    /// result of `parse_line` may be revised by a future `fail` action.
+    /// Once the branch resolves (or if no branch was entered), this returns
+    /// `false` and all ops emitted so far are final.
+    pub fn is_speculative(&self) -> bool {
+        !self.trail.live.is_empty()
+    }
+
+    /// Execute the window from `from_line` (starting mid-line at
+    /// `from_pos` there, from line start everywhere after) through the
+    /// last buffered line, or until a `fail` schedules a restart.
+    fn execute_window(
+        &mut self,
+        from_line: usize,
+        from_pos: usize,
+        from_ncpa: (usize, usize, usize),
+        syntax_set: &SyntaxSet,
+    ) -> Result<(), ParsingError> {
+        for i in from_line..self.trail.lines.len() {
+            let line = self.trail.lines[i].clone();
+            self.trail.exec_line_idx = i;
+            let (start_at, ncpa) = if i == from_line {
+                (from_pos, from_ncpa)
+            } else {
+                // Suppression entries are keyed to byte offsets of the
+                // line they were created on.
+                self.skipped_branches.clear();
+                (0, (0, 0, 0))
+            };
+            let mut ops = std::mem::take(&mut self.trail.provisional[i]);
+            self.execute_line_from(&line, syntax_set, start_at, ncpa, &mut ops)?;
+            self.trail.provisional[i] = ops;
+            if self.trail.pending_backtrack.is_some() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The per-line token loop: mirrors the legacy engine's
+    /// `parse_line_inner_from`, plus checkpoint-aware resume (caller
+    /// provides the ops prefix and the loop-guard state) and live-branch
+    /// pruning after every token.
+    fn execute_line_from(
+        &mut self,
+        line: &str,
+        syntax_set: &SyntaxSet,
+        start_at: usize,
+        ncpa: (usize, usize, usize),
+        res: &mut Vec<(usize, ScopeStackOp)>,
+    ) -> Result<(), ParsingError> {
+        let mut match_start = start_at;
+
+        if start_at == 0 && self.core.first_line {
+            let cur_level = &self.core.stack[self.core.stack.len() - 1];
+            let context = syntax_set.get_context(&cur_level.context)?;
+            if !context.meta_content_scope.is_empty() {
+                res.push((0, ScopeStackOp::Push(context.meta_content_scope[0])));
+            }
+            self.core.first_line = false;
+        }
+
+        let mut regions = Region::new();
+        let fnv = BuildHasherDefault::<FnvHasher>::default();
+        let mut search_cache: SearchCache = HashMap::with_capacity_and_hasher(128, fnv);
+        let mut non_consuming_push_at = ncpa;
+        self.zero_width_escape_fires.clear();
+
+        while self.parse_next_token(
+            line,
+            syntax_set,
+            &mut match_start,
+            &mut search_cache,
+            &mut regions,
+            &mut non_consuming_push_at,
+            res,
+        )? {
+            if self.trail.pending_backtrack.is_some() {
+                break;
+            }
+            self.prune_dead_branches();
+        }
+        self.prune_dead_branches();
+        Ok(())
+    }
+
+    /// Finalize decisions whose alternative frame is no longer on the
+    /// stack. One post-token hook replaces the legacy engine's prune
+    /// sites in `perform_op` (Pop/Set/pop+push) and `exec_escape`.
+    fn prune_dead_branches(&mut self) {
+        if !self.trail.live.is_empty() {
+            let stack_len = self.core.stack.len();
+            self.trail.live.retain(|b| b.alive(stack_len));
+        }
+    }
+
+    /// Consult or extend the trail for a branch trigger matched from
+    /// `pos`. Returns the alternative to push, or `None` when the
+    /// decision is `Refuse` — the caller must suppress the branch
+    /// pattern at this cursor and re-search so the parent context's
+    /// next rule gets a chance.
+    pub(super) fn decide_branch(
+        &mut self,
+        name: &str,
+        num_alts: usize,
+        pop_count: usize,
+        pos: usize,
+        ops_len: usize,
+        non_consuming_push_at: (usize, usize, usize),
+    ) -> Option<usize> {
+        let line_idx = self.trail.exec_line_idx;
+        if self.trail.cursor < self.trail.trail.len() {
+            // Deterministic replay: the branch encountered at the cursor
+            // must be the one recorded there.
+            let d = &self.trail.trail[self.trail.cursor];
+            let matches_recorded =
+                d.name == name && d.checkpoint.line_idx == line_idx && d.checkpoint.pos == pos;
+            debug_assert!(
+                matches_recorded,
+                "trail replay diverged: recorded {:?}@({},{}) but encountered {:?}@({},{})",
+                d.name, d.checkpoint.line_idx, d.checkpoint.pos, name, line_idx, pos
+            );
+            if matches_recorded {
+                let idx = self.trail.cursor;
+                self.trail.cursor += 1;
+                match self.trail.trail[idx].choice {
+                    Choice::Take(alt) => {
+                        let d = &self.trail.trail[idx];
+                        self.trail.live.push(LiveBranch {
+                            decision_idx: idx,
+                            name: d.name.clone(),
+                            stack_depth: d.stack_depth,
+                            pop_count: d.pop_count,
+                            created_line: d.created_line,
+                        });
+                        return Some(alt);
+                    }
+                    Choice::Refuse => {
+                        self.skipped_branches.push((pos, name.to_string()));
+                        return None;
+                    }
+                }
+            }
+            // Defensive (unreachable if replay is deterministic): drop
+            // the stale suffix and fall through to a fresh decision.
+            let cut = self.trail.cursor;
+            self.trail.trail.truncate(cut);
+            self.trail.live.retain(|b| b.decision_idx < cut);
+        }
+
+        let idx = self.trail.trail.len();
+        let decision = Decision {
+            name: name.to_string(),
+            choice: Choice::Take(0),
+            num_alts,
+            stack_depth: self.core.stack.len(),
+            pop_count,
+            created_line: self.trail.base_line + line_idx,
+            checkpoint: Checkpoint {
+                core: self.core.clone(),
+                line_idx,
+                pos,
+                ops_len,
+                non_consuming_push_at,
+                skipped_branches: self.skipped_branches.clone(),
+                live: self.trail.live.clone(),
+            },
+        };
+        self.trail.live.push(LiveBranch {
+            decision_idx: idx,
+            name: decision.name.clone(),
+            stack_depth: decision.stack_depth,
+            pop_count: decision.pop_count,
+            created_line: decision.created_line,
+        });
+        self.trail.trail.push(decision);
+        self.trail.cursor = idx + 1;
+        Some(0)
+    }
+
+    /// The alternative chosen by [`decide_branch`], handed to
+    /// `exec_pattern`'s branch arm.
+    ///
+    /// [`decide_branch`]: ParseState::decide_branch
+    pub(super) fn take_pending_alt(&mut self) -> Option<usize> {
+        self.trail.pending_alt.take()
+    }
+
+    /// Stash the alternative chosen by [`decide_branch`] for
+    /// `exec_pattern`.
+    ///
+    /// [`decide_branch`]: ParseState::decide_branch
+    pub(super) fn set_pending_alt(&mut self, alt: usize) {
+        self.trail.pending_alt = Some(alt);
+    }
+
+    /// Handle a `fail` action: bump the most recent live same-name
+    /// decision to its next alternative (or `Refuse` when exhausted) and
+    /// schedule a restart from its checkpoint. Returns `false` when the
+    /// fail is a no-op — no live same-name decision, or the restart
+    /// budget is exhausted.
+    pub(super) fn fail_branch(&mut self, name: &str) -> bool {
+        let stack_len = self.core.stack.len();
+        let Some(live_idx) = self
+            .trail
+            .live
+            .iter()
+            .rposition(|b| b.name == name && b.alive(stack_len))
+        else {
+            return false;
+        };
+        let decision_idx = self.trail.live[live_idx].decision_idx;
+
+        let budget = RESTART_BUDGET_PER_WINDOW_LINE * self.trail.lines.len();
+        if self.trail.restarts >= budget {
+            self.warnings.push(format!(
+                "speculation budget exhausted at branch point '{name}'; committing current parse"
+            ));
+            self.trail.live.clear();
+            return false;
+        }
+        self.trail.restarts += 1;
+
+        let d = &mut self.trail.trail[decision_idx];
+        d.choice = match d.choice {
+            Choice::Take(i) if i + 1 < d.num_alts => Choice::Take(i + 1),
+            _ => Choice::Refuse,
+        };
+        self.trail.trail.truncate(decision_idx + 1);
+        self.trail.cursor = decision_idx;
+        self.trail.pending_backtrack = Some(decision_idx);
+        true
+    }
+}

@@ -1070,13 +1070,18 @@ fn back_to_back_lrds_clear_meta_scope_via_corrected_baseline() {
              LRDs into 'bar' paragraph; consumer stack at end: {:?}",
         stack,
     );
-    let shadow_leaked = state.shadow.as_slice().contains(&lrd);
-    assert!(
-        !shadow_leaked,
-        "syntect shadow disagrees with corrected consumer stack; \
+    // The shadow stack is a legacy-engine internal (the trail engine
+    // has no consumer mirror to drift).
+    #[cfg(not(feature = "trail-engine"))]
+    {
+        let shadow_leaked = state.shadow.as_slice().contains(&lrd);
+        assert!(
+            !shadow_leaked,
+            "syntect shadow disagrees with corrected consumer stack; \
              shadow at end: {:?}",
-        state.shadow,
-    );
+            state.shadow,
+        );
+    }
 }
 
 #[cfg(feature = "default-onig")]
@@ -1152,6 +1157,9 @@ fn cross_line_pop_n_branch_point_alt_fail_unwinds_meta_scope() {
              top-level scope; final stack: {:?}",
         stack,
     );
+    // The shadow stack is a legacy-engine internal (the trail engine
+    // has no consumer mirror to drift).
+    #[cfg(not(feature = "trail-engine"))]
     assert!(
         !state.shadow.as_slice().contains(&ann),
         "syntect shadow still carries meta.annotation.identifier.java; \

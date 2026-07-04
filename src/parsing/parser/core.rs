@@ -231,12 +231,24 @@ impl ParseState {
             // a `Refuse` decision can suppress the pattern entirely and
             // a restart can resume from this exact point.
             #[cfg(feature = "trail-engine")]
+            let mut empty_line_resume = false;
+            #[cfg(feature = "trail-engine")]
             if let MatchOperation::Branch {
                 ref name,
                 ref alternatives,
                 pop_count,
             } = match_pattern.operation
             {
+                // See `defer_eol_branch`: a non-consuming branch at
+                // end-of-string on a re-executed earlier window line
+                // anchors on the next line instead (mirrors the legacy
+                // replay-time rule further down).
+                if match_end <= *start
+                    && match_end >= line.len()
+                    && self.defer_eol_branch(name, *start)
+                {
+                    return Ok(false);
+                }
                 match self.decide_branch(
                     name,
                     alternatives.len(),
@@ -245,7 +257,25 @@ impl ParseState {
                     ops.len(),
                     *non_consuming_push_at,
                 ) {
-                    Some(alt) => self.set_pending_alt(alt),
+                    Some((alt, bumped_same_line)) => {
+                        self.set_pending_alt(alt);
+                        // Empty-line continuation placement (ST parity,
+                        // mirrors the legacy same-line fail rule): when a
+                        // same-line fail bumps the alternative on an
+                        // empty line's col-0 branch, its non-consuming
+                        // replacement (typically `match: '' pop: N`) must
+                        // emit its pops past EOL so the empty line keeps
+                        // the parent meta scope (e.g. Markdown's
+                        // `meta.link.reference.def.markdown` on the blank
+                        // line inside a link-reference-definition title).
+                        if bumped_same_line
+                            && *start == 0
+                            && line.len() <= 1
+                            && line.trim().is_empty()
+                        {
+                            empty_line_resume = true;
+                        }
+                    }
                     None => {
                         // Refused: re-search at the same cursor with the
                         // branch pattern suppressed, so the parent
@@ -326,6 +356,11 @@ impl ParseState {
                 ops,
                 search_cache,
             )?;
+
+            #[cfg(feature = "trail-engine")]
+            if empty_line_resume {
+                *start = line.len();
+            }
 
             Ok(true)
         } else if self.skipped_branches.iter().any(|(c, _)| *c == *start) {

@@ -69,6 +69,12 @@ struct Decision {
     pop_count: usize,
     /// Absolute line number of creation, for 128-line expiry.
     created_line: usize,
+    /// Whether the most recent bump came from a `fail` on the
+    /// decision's own line. Drives the empty-line pop placement rule
+    /// (the legacy engine's same-line fail path has the same
+    /// distinction — its cross-line replay path never relocates the
+    /// resume cursor).
+    bumped_same_line: bool,
     checkpoint: Checkpoint,
 }
 
@@ -345,10 +351,11 @@ impl ParseState {
     }
 
     /// Consult or extend the trail for a branch trigger matched from
-    /// `pos`. Returns the alternative to push, or `None` when the
-    /// decision is `Refuse` — the caller must suppress the branch
-    /// pattern at this cursor and re-search so the parent context's
-    /// next rule gets a chance.
+    /// `pos`. Returns the alternative to push plus whether it is a
+    /// bumped replacement (a replayed decision past its first
+    /// alternative), or `None` when the decision is `Refuse` — the
+    /// caller must suppress the branch pattern at this cursor and
+    /// re-search so the parent context's next rule gets a chance.
     pub(super) fn decide_branch(
         &mut self,
         name: &str,
@@ -357,7 +364,7 @@ impl ParseState {
         pos: usize,
         ops_len: usize,
         non_consuming_push_at: (usize, usize, usize),
-    ) -> Option<usize> {
+    ) -> Option<(usize, bool)> {
         let line_idx = self.trail.exec_line_idx;
         if self.trail.cursor < self.trail.trail.len() {
             // Deterministic replay: the branch encountered at the cursor
@@ -383,7 +390,7 @@ impl ParseState {
                             pop_count: d.pop_count,
                             created_line: d.created_line,
                         });
-                        return Some(alt);
+                        return Some((alt, self.trail.trail[idx].bumped_same_line));
                     }
                     Choice::Refuse => {
                         self.skipped_branches.push((pos, name.to_string()));
@@ -406,6 +413,7 @@ impl ParseState {
             stack_depth: self.core.stack.len(),
             pop_count,
             created_line: self.trail.base_line + line_idx,
+            bumped_same_line: false,
             checkpoint: Checkpoint {
                 core: self.core.clone(),
                 line_idx,
@@ -425,7 +433,40 @@ impl ParseState {
         });
         self.trail.trail.push(decision);
         self.trail.cursor = idx + 1;
-        Some(0)
+        Some((0, false))
+    }
+
+    /// Port of the legacy engine's replay-time rule: during
+    /// re-execution of an earlier window line, a non-consuming branch
+    /// whose match lands past every character of the line must not
+    /// anchor a decision there — the line's re-execution ends and the
+    /// branch re-fires at the start of the next line as a fresh
+    /// decision, so its eventual failure attaches its pops to that
+    /// line's baseline instead of collapsing the parent context one
+    /// boundary too early (Markdown's LRD blank line). Returns `true`
+    /// when the caller must suppress the branch and end the line.
+    pub(super) fn defer_eol_branch(&mut self, name: &str, pos: usize) -> bool {
+        if self.trail.exec_line_idx + 1 >= self.trail.lines.len() {
+            return false;
+        }
+        // If the branch at this point is the recorded decision we are
+        // replaying (the usual case: it anchored here when this line
+        // was the window's last), drop it — the next line's re-fire
+        // replaces it. A non-matching cursor means the previous pass
+        // deferred here too and the recorded decision belongs to a
+        // later point; keep it.
+        if self.trail.cursor < self.trail.trail.len() {
+            let d = &self.trail.trail[self.trail.cursor];
+            if d.name == name
+                && d.checkpoint.line_idx == self.trail.exec_line_idx
+                && d.checkpoint.pos == pos
+            {
+                let cut = self.trail.cursor;
+                self.trail.trail.truncate(cut);
+                self.trail.live.retain(|b| b.decision_idx < cut);
+            }
+        }
+        true
     }
 
     /// The alternative chosen by [`decide_branch`], handed to
@@ -471,11 +512,13 @@ impl ParseState {
         }
         self.trail.restarts += 1;
 
+        let fail_line_idx = self.trail.exec_line_idx;
         let d = &mut self.trail.trail[decision_idx];
         d.choice = match d.choice {
             Choice::Take(i) if i + 1 < d.num_alts => Choice::Take(i + 1),
             _ => Choice::Refuse,
         };
+        d.bumped_same_line = fail_line_idx == d.checkpoint.line_idx;
         self.trail.trail.truncate(decision_idx + 1);
         self.trail.cursor = decision_idx;
         self.trail.pending_backtrack = Some(decision_idx);

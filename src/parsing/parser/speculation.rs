@@ -525,7 +525,7 @@ impl ParseState {
         // shadow an enclosing record via `rposition`, rewinding to
         // the inner branch position instead of the outer one
         // (Haskell's raw-string QQ `[r|[a-zA-Z]|]`).
-        let stack_len = self.stack.len();
+        let stack_len = self.core.stack.len();
         let bp_index = self.branch_points.iter().rposition(|bp| {
             bp.name == name && stack_len > bp.stack_depth.saturating_sub(bp.pop_count)
         });
@@ -541,7 +541,7 @@ impl ParseState {
         // would be misclassified as same-line.
         let cur_line = match &self.replay_ctx {
             Some(ctx) => ctx.line_number,
-            None => self.line_number.saturating_sub(1),
+            None => self.core.line_number.saturating_sub(1),
         };
         let bp = &self.branch_points[bp_index];
 
@@ -560,10 +560,10 @@ impl ParseState {
         // so a `pop: N + branch_point` whose snapshot captures the
         // pre-pop depth doesn't false-positive here. Without subtracting
         // `pop_count`, Java's `pop: 2 + branch_point: annotation-qualified-parameters`
-        // failed lookup with `self.stack.len() < bp.stack_depth` and the
+        // failed lookup with `self.core.stack.len() < bp.stack_depth` and the
         // fail became a no-op, leaking `meta.annotation.identifier.java`
         // into every nested-annotation extends path.
-        if self.stack.len() <= bp.stack_depth.saturating_sub(bp.pop_count) {
+        if self.core.stack.len() <= bp.stack_depth.saturating_sub(bp.pop_count) {
             self.branch_points.remove(bp_index);
             return Ok(false);
         }
@@ -613,10 +613,10 @@ impl ParseState {
             };
             self.branch_points.remove(bp_index);
 
-            self.stack = stack_snapshot;
-            self.proto_starts = proto_starts_snapshot;
-            self.escape_stack = escape_stack_snapshot;
-            self.first_line = first_line_snapshot;
+            self.core.stack = stack_snapshot;
+            self.core.proto_starts = proto_starts_snapshot;
+            self.core.escape_stack = escape_stack_snapshot;
+            self.core.first_line = first_line_snapshot;
             *non_consuming_push_at = non_consuming_push_at_snapshot;
             ops.truncate(ops_snapshot_len.min(ops.len()));
 
@@ -778,10 +778,10 @@ impl ParseState {
         // Keep `stack_snapshot` available — the same-line fix below needs
         // it to compute popped-context meta_scope clearance via
         // `push_meta_ops`.
-        self.stack = stack_snapshot.clone();
-        self.proto_starts = proto_starts_snapshot.clone();
-        self.escape_stack = escape_stack_snapshot.clone();
-        self.first_line = first_line_snapshot;
+        self.core.stack = stack_snapshot.clone();
+        self.core.proto_starts = proto_starts_snapshot.clone();
+        self.core.escape_stack = escape_stack_snapshot.clone();
+        self.core.first_line = first_line_snapshot;
         *non_consuming_push_at = non_consuming_push_at_snapshot;
 
         // Update the branch point record before popping/pushing
@@ -791,7 +791,7 @@ impl ParseState {
         // For pop + branch: re-pop the contexts (snapshot was taken pre-pop).
         if pop_count > 0 {
             for _ in 0..pop_count {
-                self.stack.pop();
+                self.core.stack.pop();
             }
         }
 
@@ -805,7 +805,7 @@ impl ParseState {
             None => Vec::new(),
         };
 
-        self.stack.push(StateLevel {
+        self.core.stack.push(StateLevel {
             context: context_id,
             prototypes: proto_ids,
             captures,
@@ -859,10 +859,10 @@ impl ParseState {
             // annotation-modified declaration at lines 2260-2297 of
             // `syntax_test_java.java`.
             //
-            // `push_meta_ops` reads `self.stack` to compute the popped
+            // `push_meta_ops` reads `self.core.stack` to compute the popped
             // contexts' scope atoms, so swap in `stack_snapshot` (pre-pop
             // state captured at branch creation) for the duration of the
-            // calls — `self.stack` currently holds the post-set state
+            // calls — `self.core.stack` currently holds the post-set state
             // (alt N already pushed).
             let mut first_line_prefix = prefix_ops.clone();
             let synthetic_op_alt_n = MatchOperation::Push {
@@ -870,7 +870,7 @@ impl ParseState {
                 pop_count,
             };
             let level_ctx_id = stack_snapshot.last().map(|l| l.context);
-            let post_set_stack = std::mem::replace(&mut self.stack, stack_snapshot.clone());
+            let post_set_stack = std::mem::replace(&mut self.core.stack, stack_snapshot.clone());
             if let Some(level_ctx_id) = level_ctx_id {
                 let level_context = syntax_set.get_context(&level_ctx_id)?;
                 self.push_meta_ops(
@@ -898,7 +898,7 @@ impl ParseState {
                     &mut first_line_prefix,
                 )?;
             }
-            self.stack = post_set_stack;
+            self.core.stack = post_set_stack;
 
             // Snapshot the branch_points so the post-replay
             // `class_members_alt5_should_rewind` discriminator can restore them
@@ -997,10 +997,10 @@ impl ParseState {
                 // = next_alt_index + 1 (post-line-2511 advance); we
                 // overwrite to 6 below to record alt 5 as just tried.
                 self.branch_points = branch_points_snapshot_for_rewind;
-                self.stack = stack_snapshot.clone();
-                self.proto_starts = proto_starts_snapshot.clone();
-                self.escape_stack = escape_stack_snapshot.clone();
-                self.first_line = first_line_snapshot;
+                self.core.stack = stack_snapshot.clone();
+                self.core.proto_starts = proto_starts_snapshot.clone();
+                self.core.escape_stack = escape_stack_snapshot.clone();
+                self.core.first_line = first_line_snapshot;
                 *non_consuming_push_at = non_consuming_push_at_snapshot;
 
                 // Mirror line ~2511's pattern: advance past alt 5 so a
@@ -1013,7 +1013,7 @@ impl ParseState {
                 let next_alt_5 = self.branch_points[bp_index].alternatives[5].clone();
                 if pop_count > 0 {
                     for _ in 0..pop_count {
-                        self.stack.pop();
+                        self.core.stack.pop();
                     }
                 }
                 let with_prototype_5 = self.branch_points[bp_index].with_prototype.clone();
@@ -1022,7 +1022,7 @@ impl ParseState {
                     Some(ref p) => vec![p.id()?],
                     None => Vec::new(),
                 };
-                self.stack.push(StateLevel {
+                self.core.stack.push(StateLevel {
                     context: context_id_5,
                     prototypes: proto_ids_5,
                     captures: None,
@@ -1036,7 +1036,8 @@ impl ParseState {
                     pop_count,
                 };
                 let level_ctx_id_5 = stack_snapshot.last().map(|l| l.context);
-                let post_set_stack_5 = std::mem::replace(&mut self.stack, stack_snapshot.clone());
+                let post_set_stack_5 =
+                    std::mem::replace(&mut self.core.stack, stack_snapshot.clone());
                 if let Some(level_ctx_id) = level_ctx_id_5 {
                     let level_context = syntax_set.get_context(&level_ctx_id)?;
                     self.push_meta_ops(
@@ -1064,7 +1065,7 @@ impl ParseState {
                         &mut first_line_prefix_5,
                     )?;
                 }
-                self.stack = post_set_stack_5;
+                self.core.stack = post_set_stack_5;
 
                 // Re-run inner replay loop with alt 5 (mirrors lines
                 // ~2649-2693).
@@ -1220,17 +1221,17 @@ impl ParseState {
             // on the stack after the branch_point's first alt failed
             // and the second alt (`immediately-pop`) ran.
             //
-            // `push_meta_ops` reads `self.stack` to compute the
+            // `push_meta_ops` reads `self.core.stack` to compute the
             // popped contexts' scope atoms, so swap in `stack_snapshot`
             // (pre-pop state captured at branch creation) for the
-            // duration of the calls — `self.stack` currently holds the
+            // duration of the calls — `self.core.stack` currently holds the
             // post-set state (alt N already pushed).
             let synthetic_op_alt_n = MatchOperation::Push {
                 ctx_refs: vec![next_alt.clone()],
                 pop_count,
             };
             let level_ctx_id = stack_snapshot.last().map(|l| l.context);
-            let post_set_stack = std::mem::replace(&mut self.stack, stack_snapshot.clone());
+            let post_set_stack = std::mem::replace(&mut self.core.stack, stack_snapshot.clone());
             if let Some(level_ctx_id) = level_ctx_id {
                 let level_context = syntax_set.get_context(&level_ctx_id)?;
                 self.push_meta_ops(
@@ -1262,7 +1263,7 @@ impl ParseState {
                     ops,
                 )?;
             }
-            self.stack = post_set_stack;
+            self.core.stack = post_set_stack;
         }
 
         // Clear search cache since we're rewinding.

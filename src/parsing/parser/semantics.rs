@@ -50,7 +50,7 @@ pub(super) fn build_capture_ops(
 impl ParseState {
     /// Get the syntax version for the current parse state
     fn current_syntax_version(&self, syntax_set: &SyntaxSet) -> u32 {
-        if let Some(level) = self.stack.last() {
+        if let Some(level) = self.core.stack.last() {
             let syntax_index = level.context.syntax_index;
             syntax_set
                 .syntaxes()
@@ -93,7 +93,7 @@ impl ParseState {
                 // `meta_scope` / `meta_content_scope` atoms orphaned —
                 // the cause of the "scope stack grows unboundedly"
                 // cascade in Makefile and Zsh (Category A).
-                let stack_len = self.stack.len();
+                let stack_len = self.core.stack.len();
                 let pop_count = n.min(stack_len);
                 if initial {
                     // v2: if the context immediately below the top has
@@ -102,7 +102,7 @@ impl ParseState {
                     let skip = version >= 2
                         && stack_len >= 2
                         && syntax_set
-                            .get_context(&self.stack[stack_len - 2].context)
+                            .get_context(&self.core.stack[stack_len - 2].context)
                             .map(|c| c.embed_scope_replaces)
                             .unwrap_or(false);
                     if !skip && !cur_context.meta_content_scope.is_empty() {
@@ -143,11 +143,11 @@ impl ParseState {
                     // in reverse).
                     for depth in 1..pop_count {
                         let level_idx = stack_len - 1 - depth;
-                        let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
+                        let ctx = syntax_set.get_context(&self.core.stack[level_idx].context)?;
                         let skip_content = version >= 2
                             && level_idx >= 1
                             && syntax_set
-                                .get_context(&self.stack[level_idx - 1].context)
+                                .get_context(&self.core.stack[level_idx - 1].context)
                                 .map(|c| c.embed_scope_replaces)
                                 .unwrap_or(false);
                         if !skip_content && !ctx.meta_content_scope.is_empty() {
@@ -213,11 +213,11 @@ impl ParseState {
                     // bash fenced blocks where `source.shell.bash` (the
                     // last embed_scope token) was disappearing on the
                     // embedded main's first `set:` rule.
-                    let stack_len = self.stack.len();
+                    let stack_len = self.core.stack.len();
                     let skip_cur_mcs_pop = version >= 2
                         && stack_len >= 2
                         && syntax_set
-                            .get_context(&self.stack[stack_len - 2].context)
+                            .get_context(&self.core.stack[stack_len - 2].context)
                             .map(|c| c.embed_scope_replaces)
                             .unwrap_or(false);
                     if is_set
@@ -232,7 +232,7 @@ impl ParseState {
                         // the syntax's top-level scope; if they match,
                         // exclude position 0 from the Pop so the matched
                         // text retains the file scope.
-                        let cur_syntax_idx = self.stack[stack_len - 1].context.syntax_index;
+                        let cur_syntax_idx = self.core.stack[stack_len - 1].context.syntax_index;
                         let top_level_scope =
                             syntax_set.syntaxes().get(cur_syntax_idx).map(|s| s.scope);
                         let mut pop_count = cur_context.meta_content_scope.len();
@@ -274,10 +274,11 @@ impl ParseState {
                     let mut apply_initial_deeper_pop = is_push_with_pop && push_pop_count > 1;
                     apply_initial_deeper_pop &= cur_context.clear_scopes.is_none();
                     if apply_initial_deeper_pop {
-                        let stack_len = self.stack.len();
+                        let stack_len = self.core.stack.len();
                         for depth in 1..push_pop_count.min(stack_len) {
                             let level_idx = stack_len - 1 - depth;
-                            let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
+                            let ctx =
+                                syntax_set.get_context(&self.core.stack[level_idx].context)?;
                             if ctx.clear_scopes.is_some() {
                                 apply_initial_deeper_pop = false;
                                 break;
@@ -289,10 +290,11 @@ impl ParseState {
                         if cur_ms_rotate > 0 {
                             ops.push((index, ScopeStackOp::Pop(cur_ms_rotate)));
                         }
-                        let stack_len = self.stack.len();
+                        let stack_len = self.core.stack.len();
                         for depth in 1..push_pop_count.min(stack_len) {
                             let level_idx = stack_len - 1 - depth;
-                            let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
+                            let ctx =
+                                syntax_set.get_context(&self.core.stack[level_idx].context)?;
                             if !ctx.meta_content_scope.is_empty() {
                                 ops.push((index, ScopeStackOp::Pop(ctx.meta_content_scope.len())));
                             }
@@ -612,10 +614,11 @@ impl ParseState {
                         // initial phase already; it doesn't reach this arm
                         // because `is_set` is false there.
                         if is_set && set_pop_count > 1 {
-                            let stack_len = self.stack.len();
+                            let stack_len = self.core.stack.len();
                             for depth in 1..set_pop_count.min(stack_len) {
                                 let level_idx = stack_len - 1 - depth;
-                                let ctx = syntax_set.get_context(&self.stack[level_idx].context)?;
+                                let ctx =
+                                    syntax_set.get_context(&self.core.stack[level_idx].context)?;
                                 if !ctx.meta_content_scope.is_empty() {
                                     ops.push((
                                         index,
@@ -865,19 +868,19 @@ impl ParseState {
                 // `with_prototype` from the leaving context stays active on
                 // the new push (same convention as Set).
                 let old_proto_ids = if pop_count > 0 {
-                    let topmost = self.stack.pop().map(|s| s.prototypes);
+                    let topmost = self.core.stack.pop().map(|s| s.prototypes);
                     for _ in 1..pop_count {
-                        self.stack.pop();
+                        self.core.stack.pop();
                     }
                     topmost
                 } else {
                     None
                 };
                 if pop_count > 0 {
-                    let final_len = self.stack.len() + ctx_refs.len();
+                    let final_len = self.core.stack.len() + ctx_refs.len();
                     self.branch_points
                         .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
-                    self.escape_stack.retain(|e| e.stack_depth < final_len);
+                    self.core.escape_stack.retain(|e| e.stack_depth < final_len);
                 }
                 (ctx_refs, old_proto_ids, false)
             }
@@ -888,12 +891,12 @@ impl ParseState {
             } => {
                 if pop_count > 0 {
                     for _ in 0..pop_count {
-                        self.stack.pop();
+                        self.core.stack.pop();
                     }
-                    let stack_len = self.stack.len();
+                    let stack_len = self.core.stack.len();
                     self.branch_points
                         .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
-                    self.escape_stack.retain(|e| e.stack_depth < stack_len);
+                    self.core.escape_stack.retain(|e| e.stack_depth < stack_len);
                 }
                 (contexts, None, true)
             }
@@ -907,9 +910,9 @@ impl ParseState {
                 // (pop_count > 1), the topmost popped frame's prototypes are
                 // what carry forward onto the new push.
                 let pops = pop_count.max(1);
-                let old_proto_ids = self.stack.pop().map(|s| s.prototypes);
+                let old_proto_ids = self.core.stack.pop().map(|s| s.prototypes);
                 for _ in 1..pops {
-                    self.stack.pop();
+                    self.core.stack.pop();
                 }
                 // Prune branch_points / escape_stack against the *final* stack
                 // length (after the common push loop below).
@@ -928,24 +931,24 @@ impl ParseState {
                 // making its later `(?=\S)` `fail` a no-op and leaking
                 // `meta.annotation.identifier.java meta.path.java` past
                 // every nested-annotation extends path.
-                let final_len = self.stack.len() + ctx_refs.len();
+                let final_len = self.core.stack.len() + ctx_refs.len();
                 self.branch_points
                     .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
-                self.escape_stack.retain(|e| e.stack_depth < final_len);
+                self.core.escape_stack.retain(|e| e.stack_depth < final_len);
                 (ctx_refs, old_proto_ids, false)
             }
             MatchOperation::Pop(n) => {
                 for _ in 0..n {
-                    self.stack.pop();
+                    self.core.stack.pop();
                 }
                 // Invalidate branch points whose alt frame is no longer on
                 // the stack. Use the same threshold as `handle_fail`'s
                 // validity check — see the comment in the Set arm above.
-                let stack_len = self.stack.len();
+                let stack_len = self.core.stack.len();
                 self.branch_points
                     .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
                 // Remove escape entries whose stack_depth >= current stack
-                self.escape_stack.retain(|e| e.stack_depth < stack_len);
+                self.core.escape_stack.retain(|e| e.stack_depth < stack_len);
                 return Ok(true);
             }
             MatchOperation::None => return Ok(false),
@@ -956,7 +959,7 @@ impl ParseState {
         };
 
         // Record stack depth before pushing (for Embed escape entry)
-        let stack_depth_before = self.stack.len();
+        let stack_depth_before = self.core.stack.len();
 
         for (i, r) in ctx_refs.iter().enumerate() {
             let mut proto_ids = if i == 0 {
@@ -992,7 +995,7 @@ impl ParseState {
                     None
                 }
             };
-            self.stack.push(StateLevel {
+            self.core.stack.push(StateLevel {
                 context: context_id,
                 prototypes: proto_ids,
                 captures,
@@ -1012,7 +1015,7 @@ impl ParseState {
                 } else {
                     escape.escape_regex.clone()
                 };
-                self.escape_stack.push(EscapeEntry {
+                self.core.escape_stack.push(EscapeEntry {
                     regex: resolved_regex,
                     captures: escape.escape_captures.clone(),
                     stack_depth: stack_depth_before,

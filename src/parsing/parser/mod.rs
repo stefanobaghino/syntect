@@ -84,17 +84,31 @@ pub struct ParseLineOutput {
 /// alt-cycle replays that re-encounter the same offset.
 const ZERO_WIDTH_ESCAPE_FIRE_LIMIT: u32 = 100;
 
+/// The pure interpreter state of the parser: what the executor reads and
+/// writes while matching a line, independent of the speculation machinery
+/// (branch points, buffered lines, corrected ops) that lives directly on
+/// [`ParseState`]. Cloning a `Core` captures everything needed to resume
+/// parsing from this point.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ParseState {
+struct Core {
     stack: Vec<StateLevel>,
     first_line: bool,
     // See issue #101. Contains indices of frames pushed by `with_prototype`s.
     // Doesn't look at `with_prototype`s below top of stack.
     proto_starts: Vec<usize>,
-    /// Active branch points for backtracking support.
-    branch_points: Vec<BranchPoint>,
     /// Line counter for 128-line branch point expiry.
     line_number: usize,
+    /// Active escape patterns from embed operations. The escape regex takes
+    /// strict precedence over normal patterns — it is checked first and can
+    /// truncate the search region.
+    escape_stack: Vec<EscapeEntry>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ParseState {
+    core: Core,
+    /// Active branch points for backtracking support.
+    branch_points: Vec<BranchPoint>,
     /// Line strings buffered while branch points are active, for potential
     /// cross-line `fail` replay. Only the strings are stored; the ops are
     /// returned to callers immediately (same as before).
@@ -120,10 +134,6 @@ pub struct ParseState {
     flushed_ops_bp_per_slot: Vec<BpInfo>,
     /// Warnings accumulated during parsing, drained into `ParseLineOutput`.
     warnings: Vec<String>,
-    /// Active escape patterns from embed operations. The escape regex takes
-    /// strict precedence over normal patterns — it is checked first and can
-    /// truncate the search region.
-    escape_stack: Vec<EscapeEntry>,
     /// Mirror of the consumer's scope stack. Updated at `parse_line`
     /// boundaries (not mid-line) from the returned `ops` and
     /// `replayed`, mirroring the consumer's behaviour (reset to the
@@ -131,7 +141,7 @@ pub struct ParseState {
     /// current ops). `exec_escape` uses it to detect orphan atoms left
     /// on the consumer's stack by a prior cross-line replay whose
     /// later same-line fails truncated the owning context out of
-    /// `self.stack` (the Push for the atom is committed in
+    /// `self.core.stack` (the Push for the atom is committed in
     /// `flushed_ops`, so it can't be taken back by `ops.truncate`) —
     /// and emits a balancing Pop before the normal escape pops.
     shadow: ScopeStack,
@@ -355,18 +365,20 @@ impl ParseState {
             captures: None,
         };
         ParseState {
-            stack: vec![start_state],
-            first_line: true,
-            proto_starts: Vec::new(),
+            core: Core {
+                stack: vec![start_state],
+                first_line: true,
+                proto_starts: Vec::new(),
+                line_number: 0,
+                escape_stack: Vec::new(),
+            },
             branch_points: Vec::new(),
-            line_number: 0,
             pending_lines: Vec::new(),
             pending_line_start_shadows: Vec::new(),
             flushed_ops: Vec::new(),
             flushed_ops_start: None,
             flushed_ops_bp_per_slot: Vec::new(),
             warnings: Vec::new(),
-            escape_stack: Vec::new(),
             shadow: ScopeStack::new(),
             replay_ctx: None,
             replay_prefix_ops: None,
@@ -400,7 +412,7 @@ impl ParseState {
         line: &str,
         syntax_set: &SyntaxSet,
     ) -> Result<ParseLineOutput, ParsingError> {
-        if self.stack.is_empty() {
+        if self.core.stack.is_empty() {
             return Err(ParsingError::MissingMainContext);
         }
 
@@ -409,7 +421,7 @@ impl ParseState {
         self.skipped_branches.clear();
 
         // Prune branch points older than 128 lines
-        let cur_line = self.line_number;
+        let cur_line = self.core.line_number;
         let warnings = &mut self.warnings;
         self.branch_points.retain(|bp| {
             let alive = cur_line.saturating_sub(bp.line_number) <= 128;
@@ -421,7 +433,7 @@ impl ParseState {
             }
             alive
         });
-        self.line_number += 1;
+        self.core.line_number += 1;
 
         let pending_lines_before = self.pending_lines.len();
 
@@ -535,13 +547,13 @@ impl ParseState {
         let mut match_start = start_at;
         let mut res = Vec::new();
 
-        if start_at == 0 && self.first_line {
-            let cur_level = &self.stack[self.stack.len() - 1];
+        if start_at == 0 && self.core.first_line {
+            let cur_level = &self.core.stack[self.core.stack.len() - 1];
             let context = syntax_set.get_context(&cur_level.context)?;
             if !context.meta_content_scope.is_empty() {
                 res.push((0, ScopeStackOp::Push(context.meta_content_scope[0])));
             }
-            self.first_line = false;
+            self.core.first_line = false;
         }
 
         let mut regions = Region::new();

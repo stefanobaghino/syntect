@@ -110,18 +110,20 @@ impl ParseState {
     ) -> Result<bool, ParsingError> {
         let (check_pop_loop, pre_push_depth) = {
             let (pos, pre, post) = *non_consuming_push_at;
-            let armed = pos == *start && pre < self.stack.len() && self.stack.len() <= post;
+            let armed =
+                pos == *start && pre < self.core.stack.len() && self.core.stack.len() <= post;
             (armed, pre)
         };
 
         // Trim proto_starts that are no longer valid
         while self
+            .core
             .proto_starts
             .last()
-            .map(|start| *start >= self.stack.len())
+            .map(|start| *start >= self.core.stack.len())
             .unwrap_or(false)
         {
-            self.proto_starts.pop();
+            self.core.proto_starts.pop();
         }
 
         let best_match = self.find_best_match(
@@ -209,7 +211,7 @@ impl ParseState {
             let match_pattern = context.match_at(reg_match.pat_index)?;
             if let MatchOperation::Fail(_) = match_pattern.operation {
                 let level_context = {
-                    let id = &self.stack[self.stack.len() - 1].context;
+                    let id = &self.core.stack[self.core.stack.len() - 1].context;
                     syntax_set.get_context(id)?
                 };
                 return self.exec_pattern(
@@ -242,7 +244,7 @@ impl ParseState {
                     _ => 0,
                 };
                 if k > 0 {
-                    let pre = self.stack.len();
+                    let pre = self.core.stack.len();
                     let post = pre + k;
                     *non_consuming_push_at = (match_end, pre, post);
                 }
@@ -277,11 +279,11 @@ impl ParseState {
             // ignore `with_prototype`s below this if a context is pushed
             if reg_match.from_with_prototype {
                 // use current height, since we're before the actual push
-                self.proto_starts.push(self.stack.len());
+                self.core.proto_starts.push(self.core.stack.len());
             }
 
             let level_context = {
-                let id = &self.stack[self.stack.len() - 1].context;
+                let id = &self.core.stack[self.core.stack.len() - 1].context;
                 syntax_set.get_context(id)?
             };
             self.exec_pattern(
@@ -323,7 +325,7 @@ impl ParseState {
         check_pop_loop: bool,
         pre_push_depth: usize,
     ) -> Result<Option<RegexMatch<'a>>, ParsingError> {
-        let cur_level = &self.stack[self.stack.len() - 1];
+        let cur_level = &self.core.stack[self.core.stack.len() - 1];
         let context = syntax_set.get_context(&cur_level.context)?;
         let prototype = if let Some(ref p) = context.prototype {
             Some(p)
@@ -333,9 +335,9 @@ impl ParseState {
 
         // Build an iterator for the contexts we want to visit in order
         let context_chain = {
-            let proto_start = self.proto_starts.last().cloned().unwrap_or(0);
+            let proto_start = self.core.proto_starts.last().cloned().unwrap_or(0);
             // Sublime applies with_prototypes from bottom to top
-            let with_prototypes = self.stack[proto_start..].iter().flat_map(|lvl| {
+            let with_prototypes = self.core.stack[proto_start..].iter().flat_map(|lvl| {
                 lvl.prototypes
                     .iter()
                     .map(move |ctx| (true, ctx, lvl.captures.as_ref()))
@@ -355,7 +357,7 @@ impl ParseState {
         let mut search_end = line.len();
         let mut escape_match: Option<(usize, Region)> = None; // (escape_stack_index, region)
 
-        for (ei, entry) in self.escape_stack.iter().enumerate() {
+        for (ei, entry) in self.core.escape_stack.iter().enumerate() {
             let mut esc_regions = Region::new();
             if entry
                 .regex
@@ -417,7 +419,7 @@ impl ParseState {
                 ) {
                     let (match_start, match_end) = match_region.pos(0).unwrap();
 
-                    // println!("matched pattern {:?} at start {} end {} (pop would loop: {}, min start: {}, initial start: {}, check_pop_loop: {}, stack_len: {})", match_pat, match_start, match_end, pop_would_loop, min_start, start, check_pop_loop, self.stack.len());
+                    // println!("matched pattern {:?} at start {} end {} (pop would loop: {}, min start: {}, initial start: {}, check_pop_loop: {}, stack_len: {})", match_pat, match_start, match_end, pop_would_loop, min_start, start, check_pop_loop, self.core.stack.len());
 
                     if match_start < min_start || (match_start == min_start && pop_would_loop) {
                         // New match is earlier in text than old match,
@@ -443,7 +445,7 @@ impl ParseState {
                             && !consuming
                             && match &match_pat.operation {
                                 MatchOperation::Pop(n) => {
-                                    self.stack.len().saturating_sub(*n) == pre_push_depth
+                                    self.core.stack.len().saturating_sub(*n) == pre_push_depth
                                 }
                                 _ => false,
                             };
@@ -453,7 +455,7 @@ impl ParseState {
                             MatchOperation::Push { .. }
                                 | MatchOperation::Branch { .. }
                                 | MatchOperation::Embed { .. }
-                        ) && self.stack.len() >= 100;
+                        ) && self.core.stack.len() >= 100;
 
                         if push_too_deep {
                             return Ok(None);
@@ -555,7 +557,7 @@ impl ParseState {
                 MatchOperation::None => match_start != match_end,
                 MatchOperation::Push { .. }
                 | MatchOperation::Branch { .. }
-                | MatchOperation::Embed { .. } => self.stack.len() < 100,
+                | MatchOperation::Embed { .. } => self.core.stack.len() < 100,
                 _ => true,
             };
             if can_cache && does_something && search_end == line.len() {
@@ -625,13 +627,16 @@ impl ParseState {
                 // keyword's own scopes so a same-line fail rewind can
                 // re-emit them (they were truncated off `ops` along
                 // with the alt[0]'s subsequent work).
-                // When `handle_fail` is mid-replay, `self.line_number` /
+                // When `handle_fail` is mid-replay, `self.core.line_number` /
                 // `self.pending_lines` still reflect the *outer* current
                 // line — read through `replay_ctx` so a branch born
                 // during replay anchors to the virtual replay line `L+i`.
                 let (bp_line_number, bp_pending_lines_snapshot_len) = match &self.replay_ctx {
                     Some(ctx) => (ctx.line_number, ctx.pending_lines_snapshot_offset),
-                    None => (self.line_number.saturating_sub(1), self.pending_lines.len()),
+                    None => (
+                        self.core.line_number.saturating_sub(1),
+                        self.pending_lines.len(),
+                    ),
                 };
                 // When this branch is born inside an outer cross-line
                 // replay's `parse_line_inner_from`, the local `ops` Vec
@@ -656,19 +661,19 @@ impl ParseState {
                     name: name.clone(),
                     next_alternative: 1, // 0 is about to be pushed
                     alternatives: alternatives.clone(),
-                    stack_snapshot: self.stack.clone(),
-                    proto_starts_snapshot: self.proto_starts.clone(),
+                    stack_snapshot: self.core.stack.clone(),
+                    proto_starts_snapshot: self.core.proto_starts.clone(),
                     match_start: *start, // position before this match's advance
                     trigger_match_start: match_start,
                     pat_scope: pat.scope.clone(),
                     line_number: bp_line_number,
                     ops_snapshot_len: ops.len(),
-                    stack_depth: self.stack.len(),
+                    stack_depth: self.core.stack.len(),
                     non_consuming_push_at_snapshot: *non_consuming_push_at,
-                    first_line_snapshot: self.first_line,
+                    first_line_snapshot: self.core.first_line,
                     with_prototype: pat.with_prototype.clone(),
                     pending_lines_snapshot_len: bp_pending_lines_snapshot_len,
-                    escape_stack_snapshot: self.escape_stack.clone(),
+                    escape_stack_snapshot: self.core.escape_stack.clone(),
                     pop_count,
                     prefix_ops,
                     capture_ops: pat

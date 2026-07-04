@@ -15,13 +15,13 @@ impl ParseState {
         syntax_set: &SyntaxSet,
         ops: &mut Vec<(usize, ScopeStackOp)>,
     ) -> Result<(), ParsingError> {
-        let entry = &self.escape_stack[escape_idx];
+        let entry = &self.core.escape_stack[escape_idx];
         let target_depth = entry.stack_depth;
         let escape_captures = entry.captures.clone();
 
         // Drain orphan scope atoms left on the consumer's scope stack by
         // a prior cross-line replay whose later same-line fails
-        // truncated the owning context out of `self.stack` — the Push
+        // truncated the owning context out of `self.core.stack` — the Push
         // was committed to `flushed_ops` and can't be unwound by
         // `ops.truncate`, so we emit a balancing Pop here. Without this,
         // e.g. LaTeX `\end{lstlisting}` leaves
@@ -32,7 +32,7 @@ impl ParseState {
         // `shadow` mirrors what the consumer will actually hold at this
         // point: end-of-prior-line shadow + ops-so-far on the current
         // line. `expected_depth` is what the consumer *should* have
-        // based on `self.stack`'s meta_scope / meta_content_scope
+        // based on `self.core.stack`'s meta_scope / meta_content_scope
         // contributions (with the v2 `embed_scope_replaces` mcs gating
         // applied below, matching the pop loop).
         let mut current_shadow = self.shadow.clone();
@@ -43,7 +43,7 @@ impl ParseState {
         let expected_depth: usize = {
             let mut total = 0usize;
             let mut prev_embed_scope_replaces = false;
-            for lvl in &self.stack {
+            for lvl in &self.core.stack {
                 let ctx = syntax_set.get_context(&lvl.context)?;
                 total += ctx.meta_scope.len();
                 if !prev_embed_scope_replaces {
@@ -61,8 +61,8 @@ impl ParseState {
         }
 
         // Pop all stack levels down to target_depth, emitting proper meta scope pops
-        while self.stack.len() > target_depth {
-            let level = &self.stack[self.stack.len() - 1];
+        while self.core.stack.len() > target_depth {
+            let level = &self.core.stack[self.core.stack.len() - 1];
             let ctx = syntax_set.get_context(&level.context)?;
 
             // Pop meta_content_scope.  If the context below has
@@ -76,9 +76,9 @@ impl ParseState {
             // would otherwise Pop a scope that was never pushed, misaligning
             // every scope below until the escape closes.
             if !ctx.meta_content_scope.is_empty() {
-                let skip = self.stack.len() >= 2
+                let skip = self.core.stack.len() >= 2
                     && syntax_set
-                        .get_context(&self.stack[self.stack.len() - 2].context)
+                        .get_context(&self.core.stack[self.core.stack.len() - 2].context)
                         .map(|c| c.embed_scope_replaces)
                         .unwrap_or(false);
                 if !skip {
@@ -96,7 +96,7 @@ impl ParseState {
                 ops.push((match_start, ScopeStackOp::Restore));
             }
 
-            self.stack.pop();
+            self.core.stack.pop();
         }
 
         // Apply escape_captures scopes
@@ -123,7 +123,7 @@ impl ParseState {
         }
 
         // Remove this escape entry and any inner (later) escape entries
-        self.escape_stack.truncate(escape_idx);
+        self.core.escape_stack.truncate(escape_idx);
 
         // Invalidate branch points whose alt frame is no longer on the
         // stack. This mirrors the `alt frame still present` predicate used
@@ -131,7 +131,7 @@ impl ParseState {
         // the Push/Set/Embed/Pop retain calls): subtracting the bp's own
         // pop_count is necessary so a `pop: N + branch_point` whose
         // snapshot captures the pre-pop depth doesn't false-prune itself.
-        let stack_len = self.stack.len();
+        let stack_len = self.core.stack.len();
         self.branch_points
             .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
 

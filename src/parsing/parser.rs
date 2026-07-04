@@ -3699,9 +3699,15 @@ impl ParseState {
         // Remove this escape entry and any inner (later) escape entries
         self.escape_stack.truncate(escape_idx);
 
-        // Invalidate branch points whose stack depth is now above current stack
+        // Invalidate branch points whose alt frame is no longer on the
+        // stack. This mirrors the `alt frame still present` predicate used
+        // at the other five BP-prune sites (handle_fail's late guard plus
+        // the Push/Set/Embed/Pop retain calls): subtracting the bp's own
+        // pop_count is necessary so a `pop: N + branch_point` whose
+        // snapshot captures the pre-pop depth doesn't false-prune itself.
+        let stack_len = self.stack.len();
         self.branch_points
-            .retain(|bp| bp.stack_depth <= self.stack.len());
+            .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
 
         Ok(())
     }
@@ -9463,6 +9469,93 @@ contexts:
             "syntect shadow still carries meta.annotation.identifier.java; \
              shadow: {:?}",
             state.shadow,
+        );
+    }
+
+    #[test]
+    fn escape_prune_keeps_pop_n_branch_point_so_fail_still_rewinds() {
+        // exec_escape variant of the `pop: N + branch_point` false-prune
+        // (same class as the perform_op post-Set retain fixed by the test
+        // above): `bp.stack_depth` snapshots the *pre-pop* depth, so after
+        // an embed escape pops back to the alt frame's depth
+        // (`stack_depth - pop_count + 1`), the old exec_escape retain
+        // (`bp.stack_depth <= stack.len()`) dropped the still-valid bp.
+        // The subsequent `fail` then found no record and became a silent
+        // no-op — alt 0's meta_content_scope leaked and alt 1 never ran.
+        //
+        // Shape: `pop: 2 + branch_point` from depth 3 leaves the alt at
+        // depth 2; alt 0 enters an embed (escape entry depth 2, body at
+        // depth 3); the escape fires and exec_escape pops to depth 2,
+        // where `stack.len() (2) < bp.stack_depth (3)` but the alt frame
+        // is still present (`2 > 3 - 2`); then `fail: bp` must rewind
+        // onto alt 1.
+        let syntax_str = r#"
+name: EscapePrunePopN
+scope: source.escprunepopn
+version: 2
+contexts:
+  main:
+    - match: 'a'
+      scope: p.a
+      push: outer
+
+  outer:
+    - meta_scope: outer.test
+    - match: 'b'
+      scope: p.b
+      push: inner
+
+  inner:
+    - match: 'X'
+      pop: 2
+      branch_point: bp
+      branch: [alt0, alt1]
+    - match: '.'
+      scope: inner.char
+
+  alt0:
+    - meta_content_scope: leak.meta
+    - match: 'BEGIN'
+      embed: body
+      escape: 'END'
+    - match: 'F'
+      fail: bp
+    - match: '.'
+      scope: alt0.char
+
+  alt1:
+    - match: '\w+'
+      scope: alt1.matched
+    - match: '.'
+      scope: alt1.char
+
+  body:
+    - match: '.'
+      scope: body.char
+"#;
+        let syntax = SyntaxDefinition::load_from_str(syntax_str, true, None).unwrap();
+        let ss = link(syntax);
+        let mut state = ParseState::new(&ss.syntaxes()[0]);
+
+        // "ab" builds depth 3 (main → outer → inner). "X" fires
+        // `pop: 2 + branch_point: bp`, pushing alt0 at depth 2. "BEGIN"
+        // enters the embed, "y" is body content, "END" fires the escape
+        // (exec_escape pops back to depth 2 — the prune under test).
+        // "F" fires `fail: bp`: the rewind re-parses "BEGINyENDF" under
+        // alt1, whose `\w+` swallows it as `alt1.matched`, and the ops
+        // truncation removes every trace of alt0's `leak.meta`.
+        let line_ops = ops(&mut state, "abXBEGINyENDF\n", &ss);
+        let states = stack_states(line_ops);
+        assert!(
+            states.iter().any(|s| s.contains("alt1.matched")),
+            "fail: bp after the embed escape must rewind onto alt1 \
+             (bp falsely pruned by exec_escape?); got: {:?}",
+            states
+        );
+        assert!(
+            !states.iter().any(|s| s.contains("leak.meta")),
+            "alt0's meta_content_scope leaked past the fail rewind; got: {:?}",
+            states
         );
     }
 

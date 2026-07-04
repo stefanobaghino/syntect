@@ -1098,6 +1098,23 @@ impl core::marker::Sync for syntect::parsing::ScopeStackOp
 impl core::marker::Unpin for syntect::parsing::ScopeStackOp
 impl core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::ScopeStackOp
 impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::ScopeStackOp
+pub struct syntect::parsing::CommittedParser
+impl syntect::parsing::CommittedParser
+pub fn syntect::parsing::CommittedParser::feed(&mut self, line: &str, syntax_set: &syntect::parsing::SyntaxSet) -> core::result::Result<alloc::vec::Vec<alloc::vec::Vec<(usize, syntect::parsing::ScopeStackOp)>>, syntect::parsing::ParsingError>
+pub fn syntect::parsing::CommittedParser::finish(&mut self) -> alloc::vec::Vec<alloc::vec::Vec<(usize, syntect::parsing::ScopeStackOp)>>
+pub fn syntect::parsing::CommittedParser::new(syntax: &syntect::parsing::SyntaxReference) -> syntect::parsing::CommittedParser
+pub fn syntect::parsing::CommittedParser::state(&self) -> &syntect::parsing::ParseState
+pub fn syntect::parsing::CommittedParser::take_warnings(&mut self) -> alloc::vec::Vec<syntect::parsing::ParseWarning>
+impl core::clone::Clone for syntect::parsing::CommittedParser
+pub fn syntect::parsing::CommittedParser::clone(&self) -> syntect::parsing::CommittedParser
+impl core::fmt::Debug for syntect::parsing::CommittedParser
+pub fn syntect::parsing::CommittedParser::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for syntect::parsing::CommittedParser
+impl !core::marker::Send for syntect::parsing::CommittedParser
+impl !core::marker::Sync for syntect::parsing::CommittedParser
+impl core::marker::Unpin for syntect::parsing::CommittedParser
+impl core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::CommittedParser
+impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::CommittedParser
 pub struct syntect::parsing::MatchPower(pub f64)
 impl core::clone::Clone for syntect::parsing::MatchPower
 pub fn syntect::parsing::MatchPower::clone(&self) -> syntect::parsing::MatchPower

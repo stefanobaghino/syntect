@@ -420,6 +420,7 @@ struct RegexMatch<'a> {
 /// Maps the pattern to the start index, which is -1 if not found.
 type SearchCache = HashMap<*const MatchPattern, Option<Region>, BuildHasherDefault<FnvHasher>>;
 
+mod committed;
 mod core;
 mod embed;
 mod semantics;
@@ -430,6 +431,8 @@ mod speculation;
 mod tests;
 #[cfg(not(feature = "legacy-engine"))]
 mod trail;
+
+pub use committed::CommittedParser;
 
 impl ParseState {
     /// Creates a state from a syntax definition, keeping its own reference-counted point to the

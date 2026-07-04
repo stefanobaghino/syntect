@@ -4,6 +4,7 @@
 mod basics;
 mod branch_cross_line;
 mod branch_same_line;
+mod committed;
 mod embed;
 mod meta_ops;
 mod regressions;

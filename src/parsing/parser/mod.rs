@@ -57,20 +57,28 @@ pub enum ParsingError {
 /// [`HighlightState`]: ../highlighting/struct.HighlightState.html
 /// Output of [`ParseState::parse_line`].
 ///
-/// `ops` contains the scope-stack operations for the current line, as before.
-/// `replayed` is non-empty only after a cross-line `fail` fires: it contains
-/// the corrected ops for each buffered line (in chronological order) so that
-/// callers who want full cross-line accuracy can re-apply them.
+/// `ops` contains the scope-stack operations for the current line. They are
+/// final unless [`ParseState::speculative_lines`] returns non-zero, in which
+/// case a future call may deliver corrections through `revised`.
 ///
 /// Callers that do not need cross-line accuracy can use `.ops` directly,
 /// which behaves identically to the old `Vec<(usize, ScopeStackOp)>` return.
 #[derive(Debug, Clone, Default)]
+#[must_use]
 pub struct ParseLineOutput {
     /// Ops for the current line.
     pub ops: Vec<(usize, ScopeStackOp)>,
-    /// Ops for previously buffered lines that have now been corrected, in order.
-    /// Non-empty only when a cross-line `fail` just resolved.
-    pub replayed: Vec<Vec<(usize, ScopeStackOp)>>,
+    /// Present iff a `fail` during this call revised lines before the
+    /// current one. When present, it is a wholesale replacement for the
+    /// entire still-uncommitted window: corrected ops for the last
+    /// `revised.len()` lines before the current one, in input order.
+    ///
+    /// The parser state at the window base — the point right before the
+    /// first `revised` line — is immutable: it can never be retroactively
+    /// corrected by a later call. Consumers therefore reset their scope
+    /// stack once, to the snapshot they took at that boundary, and
+    /// re-apply `revised` then `ops`.
+    pub revised: Option<Vec<Vec<(usize, ScopeStackOp)>>>,
     /// Warnings collected during parsing (e.g. branch point expiry).
     pub warnings: Vec<ParseWarning>,
 }
@@ -161,6 +169,13 @@ pub struct ParseState {
     /// replayed).
     #[cfg(feature = "legacy-engine")]
     pending_line_start_shadows: Vec<ScopeStack>,
+    /// Ops as last returned (or corrected) for each line in
+    /// `pending_lines`, so a cross-line replay can report the entire
+    /// uncommitted window through `ParseLineOutput::revised` even though
+    /// the replay itself only recomputes lines from the rewind point
+    /// onward.
+    #[cfg(feature = "legacy-engine")]
+    pending_line_ops: Vec<Vec<(usize, ScopeStackOp)>>,
     /// Corrected ops produced by a cross-line `fail` replay, to be returned
     /// as `ParseLineOutput::replayed` at the end of `parse_line`. When
     /// populated, entry `i` corresponds to `pending_lines[flushed_ops_start + i]`.
@@ -440,6 +455,8 @@ impl ParseState {
             #[cfg(feature = "legacy-engine")]
             pending_line_start_shadows: Vec::new(),
             #[cfg(feature = "legacy-engine")]
+            pending_line_ops: Vec::new(),
+            #[cfg(feature = "legacy-engine")]
             flushed_ops: Vec::new(),
             #[cfg(feature = "legacy-engine")]
             flushed_ops_start: None,
@@ -555,6 +572,24 @@ impl ParseState {
             }
         }
 
+        // Fold the corrected ops into the per-line window buffer and
+        // expose the ENTIRE uncommitted window as `revised` — the replay
+        // only recomputed lines from the rewind point onward, but the
+        // contract hands consumers a wholesale window replacement so
+        // their reset baseline is always the immutable window base.
+        let revised = if replayed.is_empty() {
+            None
+        } else {
+            let start_idx = pending_lines_before.saturating_sub(replayed.len());
+            for (i, line_ops) in replayed.into_iter().enumerate() {
+                if let Some(slot) = self.pending_line_ops.get_mut(start_idx + i) {
+                    *slot = line_ops;
+                }
+            }
+            let window_len = pending_lines_before.min(self.pending_line_ops.len());
+            Some(self.pending_line_ops[..window_len].to_vec())
+        };
+
         // Snapshot the shadow now (post-replays, pre-current-ops) — this
         // becomes the baseline for the next line if the current line ends
         // with live branch_points and gets buffered for future replay.
@@ -569,17 +604,19 @@ impl ParseState {
             self.pending_lines.push(line.to_string());
             self.pending_line_start_shadows
                 .push(shadow_at_start_corrected);
+            self.pending_line_ops.push(ops.clone());
         } else {
             // No active branch points: any buffered strings are stale.
             self.pending_lines.clear();
             self.pending_line_start_shadows.clear();
+            self.pending_line_ops.clear();
         }
 
         let warnings = std::mem::take(&mut self.warnings);
 
         Ok(ParseLineOutput {
             ops,
-            replayed,
+            revised,
             warnings,
         })
     }
@@ -591,6 +628,20 @@ impl ParseState {
     #[cfg(feature = "legacy-engine")]
     pub fn is_speculative(&self) -> bool {
         !self.branch_points.is_empty()
+    }
+
+    /// Number of most-recently-parsed lines (including the line of the
+    /// latest `parse_line` call) whose ops may still be revised by a
+    /// future call. `0` means every op returned so far is final — the
+    /// natural boundary for caching a clone of this state or flushing
+    /// buffered output.
+    #[cfg(feature = "legacy-engine")]
+    pub fn speculative_lines(&self) -> usize {
+        if self.branch_points.is_empty() {
+            0
+        } else {
+            self.pending_lines.len()
+        }
     }
 
     /// Inner parsing loop: processes `line` with the current parser state and

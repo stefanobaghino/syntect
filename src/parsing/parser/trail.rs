@@ -135,14 +135,13 @@ pub(super) struct TrailState {
 }
 
 impl ParseState {
-    /// Parses a single line of the file. See the legacy engine's
-    /// documentation in `mod.rs` for the general contract; the trail
-    /// engine differs only in how `branch_point`/`fail` backtracking is
-    /// implemented (checkpointed re-execution of the buffered window
-    /// instead of surgical correction of already-emitted ops). The
-    /// `ParseLineOutput` contract is unchanged: `replayed` carries the
-    /// corrected ops for the last `replayed.len()` lines before this one
-    /// whenever a cross-line restart revised them.
+    /// Parses a single line of the file. See [`ParseLineOutput`] for the
+    /// output contract: `revised` replaces the whole uncommitted window
+    /// whenever a cross-line restart re-executed earlier lines, and
+    /// [`speculative_lines`] reports how many returned lines are still
+    /// subject to revision.
+    ///
+    /// [`speculative_lines`]: ParseState::speculative_lines
     pub fn parse_line(
         &mut self,
         line: &str,
@@ -221,16 +220,19 @@ impl ParseState {
         self.core.line_number = line_number_after;
 
         let ops = self.trail.provisional[cur_idx].clone();
-        let replayed = if min_rewind < cur_idx {
-            self.trail.provisional[min_rewind..cur_idx].to_vec()
+        // A restart that rewound past a line boundary re-executed earlier
+        // window lines: hand the whole window back. Same-line restarts
+        // only reshape `ops`, which is returned fresh anyway.
+        let revised = if min_rewind < cur_idx {
+            Some(self.trail.provisional[..cur_idx].to_vec())
         } else {
-            Vec::new()
+            None
         };
         let warnings = std::mem::take(&mut self.warnings);
 
         Ok(ParseLineOutput {
             ops,
-            replayed,
+            revised,
             warnings,
         })
     }
@@ -241,6 +243,19 @@ impl ParseState {
     /// `false` and all ops emitted so far are final.
     pub fn is_speculative(&self) -> bool {
         !self.trail.live.is_empty()
+    }
+
+    /// Number of most-recently-parsed lines (including the line of the
+    /// latest `parse_line` call) whose ops may still be revised by a
+    /// future call. `0` means every op returned so far is final — the
+    /// natural boundary for caching a clone of this state or flushing
+    /// buffered output.
+    pub fn speculative_lines(&self) -> usize {
+        if self.trail.live.is_empty() {
+            0
+        } else {
+            self.trail.lines.len()
+        }
     }
 
     /// Execute the window from `from_line` (starting mid-line at

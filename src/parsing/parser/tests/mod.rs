@@ -75,6 +75,11 @@ fn ops(state: &mut ParseState, line: &str, syntax_set: &SyntaxSet) -> Vec<(usize
     output.ops
 }
 
+/// The `revised` window as a slice (empty when no revision occurred).
+fn revised_lines(out: &ParseLineOutput) -> &[Vec<(usize, ScopeStackOp)>] {
+    out.revised.as_deref().unwrap_or(&[])
+}
+
 fn stack_states(ops: Vec<(usize, ScopeStackOp)>) -> Vec<String> {
     let mut states = Vec::new();
     let mut stack = ScopeStack::new();

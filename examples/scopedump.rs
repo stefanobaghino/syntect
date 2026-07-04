@@ -5,7 +5,7 @@
 //! line: an FNV-1a 64 hash over that line's folded scope-stack regions.
 //! `--full` prints the regions themselves instead, for human diffing.
 //!
-//! Cross-line backtracking (`ParseLineOutput::replayed`) is folded in before
+//! Cross-line backtracking (`ParseLineOutput::revised`) is folded in before
 //! anything is printed, so the dump reflects the final corrected scopes, not
 //! the provisional op stream. Two engines that emit differently-shaped op
 //! streams but reach the same scopes per region produce identical dumps —
@@ -128,7 +128,7 @@ fn dump_file(ss: &SyntaxSet, path: &Path, rel: &Path, full: bool) -> FileOutcome
         let current_line_number = records.len() + 1;
         let ParseLineOutput {
             ops,
-            replayed,
+            revised,
             warnings,
         } = match state.parse_line(line, ss) {
             Ok(output) => output,
@@ -142,14 +142,15 @@ fn dump_file(ss: &SyntaxSet, path: &Path, rel: &Path, full: bool) -> FileOutcome
         }
 
         // Fold corrected ops for previously-parsed lines back into their
-        // records, rebuilding the running stack from the window base.
-        if !replayed.is_empty() {
-            let start = records.len() - replayed.len();
+        // records, rebuilding the running stack from the window base
+        // (whose pre-state is immutable per the `revised` contract).
+        if let Some(revised) = &revised {
+            let start = records.len() - revised.len();
             stack = records[start].stack_before.clone();
-            for (i, replayed_ops) in replayed.iter().enumerate() {
+            for (i, revised_ops) in revised.iter().enumerate() {
                 let record = &mut records[start + i];
                 record.stack_before = stack.clone();
-                match fold_line(replayed_ops, &record.text, &mut stack) {
+                match fold_line(revised_ops, &record.text, &mut stack) {
                     Ok(folded) => record.folded = folded,
                     Err(e) => {
                         notes.push((start + i + 1, format!("replay fold error: {}", e)));

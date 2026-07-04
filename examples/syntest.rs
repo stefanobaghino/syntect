@@ -451,7 +451,7 @@ fn test_file(
     let mut assertion_failures: usize = 0;
     let mut total_assertions: usize = 0;
 
-    // Buffer for handling cross-line backtracking (replayed ops)
+    // Buffer for handling cross-line backtracking (revised ops)
     let mut parsed_line_buffer: Vec<ParsedLineRecord> = Vec::new();
     let mut current_test_line_buffer_idx: Option<usize> = None;
 
@@ -499,7 +499,7 @@ fn test_file(
             };
             let ParseLineOutput {
                 ops,
-                replayed,
+                revised,
                 warnings,
             } = output;
 
@@ -507,45 +507,33 @@ fn test_file(
                 eprintln!("Warning: {}", warning);
             }
 
-            // Handle cross-line backtracking: when `replayed` is non-empty, the
-            // parser has corrected ops for previously-parsed lines. Re-evaluate
-            // any assertions that were tested against those lines.
-            if !replayed.is_empty() {
+            // Handle cross-line backtracking: `revised` replaces the ops of
+            // every still-uncommitted line before the current one. Reset to
+            // the window base — immutable per the `revised` contract — and
+            // re-evaluate any assertions that were tested against those lines.
+            if let Some(revised) = &revised {
                 if out_opts.debug {
                     println!(
-                        "  replayed {} line(s) due to cross-line backtracking",
-                        replayed.len()
+                        "  revised {} line(s) due to cross-line backtracking",
+                        revised.len()
                     );
                 }
                 let buf_len = parsed_line_buffer.len();
-                let start_idx = buf_len - replayed.len();
+                let start_idx = buf_len - revised.len();
 
-                // Collect replayed line numbers for pruning pending messages
-                let replayed_line_numbers: Vec<usize> = (start_idx..buf_len)
+                // Collect revised line numbers for pruning pending messages
+                let revised_line_numbers: Vec<usize> = (start_idx..buf_len)
                     .map(|i| parsed_line_buffer[i].line_number)
                     .collect();
                 // Remove pending messages whose test_against_line_number
-                // matches any replayed line — they will be regenerated below
+                // matches any revised line — they will be regenerated below
                 pending_messages
-                    .retain(|m| !replayed_line_numbers.contains(&m.test_against_line_number));
+                    .retain(|m| !revised_line_numbers.contains(&m.test_against_line_number));
 
-                // Reset stack to the state before the first replayed line
+                // Reset stack to the state at the window base.
                 stack = parsed_line_buffer[start_idx].stack_before.clone();
 
-                // Collect corrected baselines to apply post-loop, since the
-                // mutable record borrow inside the loop forbids touching
-                // sibling buffer entries. After applying replayed[i],
-                // `stack` is the corrected end-of-line for the buffered
-                // record at start_idx + i, i.e. the corrected
-                // start-of-line baseline for record at start_idx + i + 1.
-                // Overwriting that baseline prevents a future replay from
-                // resurrecting any meta_scope the prior replay had unwound
-                // (observed as meta.link.reference.def.markdown leak past
-                // back-to-back Markdown link reference definitions).
-                let buf_len = parsed_line_buffer.len();
-                let mut corrected_baselines: Vec<(usize, ScopeStack)> = Vec::new();
-
-                for (i, replayed_ops) in replayed.iter().enumerate() {
+                for (i, revised_ops) in revised.iter().enumerate() {
                     let record = &mut parsed_line_buffer[start_idx + i];
                     let has_non_assertion = record.non_assertion_data.is_some();
 
@@ -553,7 +541,7 @@ fn test_file(
                     // scoped text for non-assertion lines
                     let mut new_scoped = Vec::new();
                     let mut col: usize = 0;
-                    for (s, op) in ScopeRegionIterator::new(replayed_ops, &record.line_text) {
+                    for (s, op) in ScopeRegionIterator::new(revised_ops, &record.line_text) {
                         stack.apply(op).unwrap();
                         if !s.is_empty() && has_non_assertion {
                             let len = s.chars().count();
@@ -564,10 +552,6 @@ fn test_file(
                             });
                             col += len;
                         }
-                    }
-                    let next_idx = start_idx + i + 1;
-                    if next_idx < buf_len {
-                        corrected_baselines.push((next_idx, stack.clone()));
                     }
 
                     if let Some(ref mut data) = record.non_assertion_data {
@@ -631,9 +615,6 @@ fn test_file(
                             previous_non_assertion_line = record.line_text.clone();
                         }
                     }
-                }
-                for (idx, corrected) in corrected_baselines {
-                    parsed_line_buffer[idx].stack_before = corrected;
                 }
             }
 

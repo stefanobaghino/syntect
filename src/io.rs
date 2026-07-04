@@ -357,17 +357,18 @@ impl<'a, R: ScopeRenderer, W: io::Write> HighlightedWriter<'a, R, W> {
     fn highlight_line(&mut self, line: &str) -> Result<(), Error> {
         let parse_output = self.parse_state.parse_line(line, self.syntax_set)?;
 
-        // If replayed ops arrived, patch the pending buffer in place.
-        // Per `ParseLineOutput::replayed`'s contract, the corrected ops
-        // align with the *last* `replayed.len()` entries of the pending
-        // buffer (`replayed[i] ↔ pending_lines[buf_len - replayed.len() + i]`).
-        // Zipping from index 0 instead would slide ops onto unrelated
-        // line text, panicking later in `render_line` as "byte index N
-        // out of bounds" when an op offset overshoots the misaligned
-        // line.
-        if !parse_output.replayed.is_empty() {
-            let start = self.pending_ops.len() - parse_output.replayed.len();
-            for (i, ops) in parse_output.replayed.into_iter().enumerate() {
+        // If revised ops arrived, replace the pending buffer. Per
+        // `ParseLineOutput::revised`'s contract this is a wholesale
+        // replacement for the whole uncommitted window, which is exactly
+        // the pending buffer — except when a mid-speculation state was
+        // restored via `with_state`, where the buffer only covers a
+        // suffix of the parser's window; align to the tail in that case
+        // (sliding ops onto unrelated line text panics later in
+        // `render_line` as "byte index N out of bounds").
+        if let Some(revised) = parse_output.revised {
+            let skip = revised.len().saturating_sub(self.pending_ops.len());
+            let start = self.pending_ops.len() - (revised.len() - skip);
+            for (i, ops) in revised.into_iter().skip(skip).enumerate() {
                 self.pending_ops[start + i] = ops;
             }
         }
@@ -1146,15 +1147,14 @@ contexts:
 
     #[test]
     fn replay_window_narrower_than_pending_buffer_aligns_to_last_slots() {
-        // The parser's `ParseLineOutput::replayed` aligns to the *last*
-        // `replayed.len()` entries of the consumer's pending buffer
-        // (`replayed[i] ↔ pending_ops[buf_len - replayed.len() + i]`).
+        // `ParseLineOutput::revised` aligns to the *last* `revised.len()`
+        // entries of the consumer's pending buffer
+        // (`revised[i] ↔ pending_ops[buf_len - revised.len() + i]`).
         // Sliding ops onto the wrong slot panicked TypeScript's
         // `checker.ts` in `render_line` as "byte index N out of bounds".
         //
-        // Force `pending_ops.len() > replayed.len()` by opening an outer
-        // BP on line 1 and an inner BP on line 3, then failing the inner
-        // on line 4. Replay covers line 3 only; pending = [L1, L2, L3].
+        // Open an outer BP on line 1 and an inner BP on line 3, then fail
+        // the inner on line 4: the revision covers pending = [L1, L2, L3].
         // L1 is short and L3 is long, so a slot misalignment lands ops
         // with offsets past L1's end and panics the byte-index slice.
         use crate::parsing::{SyntaxDefinition, SyntaxSetBuilder};
@@ -1204,7 +1204,7 @@ contexts:
         // L1: "OUTER\n" (6 bytes) opens bp1.
         // L2: "AB\n"    (3 bytes) ordinary content under outer-a.
         // L3: long INNER... (>>L1 len) opens bp2 inside outer-a.
-        // L4: "KILLBP2\n" fails bp2 → replayed.len() == 1 covering L3.
+        // L4: "KILLBP2\n" fails bp2 → revision covering L1..L3.
         // Pre-fix the L3 corrected ops slid onto L1's text and tripped
         // `&line[cur_index..i]` once `i` exceeded L1's 6 bytes.
         w.write_all(b"OUTER\nAB\nINNERZZZZZZZZZZZZZZZZZZZZZZZZZ\nKILLBP2\n")

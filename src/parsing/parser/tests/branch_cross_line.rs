@@ -80,7 +80,7 @@ contexts:
     // The exhaustion path replays buffered lines under the
     // restored pre-branch state, so `replayed` is non-empty.
     assert!(
-        !out2.replayed.is_empty(),
+        out2.revised.is_some(),
         "cross-line exhaustion must emit replayed ops for the pre-branch state"
     );
 
@@ -214,9 +214,9 @@ contexts:
     let out1 = state.parse_line("TRY\n", &ss).expect("parse line 1 failed");
     // replayed is empty on line 1 (no cross-line fail yet)
     assert!(
-        out1.replayed.is_empty(),
+        out1.revised.is_none(),
         "line 1: expected no replayed ops, got {:?}",
-        out1.replayed
+        out1.revised
     );
 
     // Line 2: "FAIL" triggers fail: bp — cross-line backtrack.
@@ -225,27 +225,27 @@ contexts:
         .parse_line("FAIL\n", &ss)
         .expect("parse line 2 failed");
     assert_eq!(
-        out2.replayed.len(),
+        revised_lines(&out2).len(),
         1,
         "expected exactly one replayed line, got {:?}",
-        out2.replayed
+        out2.revised
     );
-    let has_fallback = out2.replayed[0].iter().any(|(_, op)| {
+    let has_fallback = revised_lines(&out2)[0].iter().any(|(_, op)| {
             matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("fallback.content"))
         });
     assert!(
         has_fallback,
         "expected fallback.content scope in replayed line 1 ops, got: {:?}",
-        out2.replayed[0]
+        revised_lines(&out2)[0]
     );
     // The try.word scope must NOT appear in the replayed ops.
-    let has_try_word = out2.replayed[0].iter().any(
+    let has_try_word = revised_lines(&out2)[0].iter().any(
         |(_, op)| matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("try.word")),
     );
     assert!(
         !has_try_word,
         "try.word must not appear in replayed ops after backtrack, got: {:?}",
-        out2.replayed[0]
+        revised_lines(&out2)[0]
     );
     // Verify current-line ops are clean (ops.clear() fired before re-parse)
     let current_has_try = out2
@@ -314,30 +314,30 @@ contexts:
         .parse_line("FAIL\n", &ss)
         .expect("parse line 2 failed");
     assert_eq!(
-        out2.replayed.len(),
+        revised_lines(&out2).len(),
         1,
         "expected one replayed line, got {:?}",
-        out2.replayed
+        out2.revised
     );
     // The replayed ops for line 1 must still push prefix.word at col 0
     // (from prefix_ops, emitted pre-branch), not overwrite with
     // fallback.content.
-    let replayed_has_prefix = out2.replayed[0].iter().any(
+    let replayed_has_prefix = revised_lines(&out2)[0].iter().any(
         |(_, op)| matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("prefix.word")),
     );
     assert!(
         replayed_has_prefix,
         "replayed line must preserve prefix.word from pre-branch parse, got: {:?}",
-        out2.replayed[0]
+        revised_lines(&out2)[0]
     );
     // fallback.content should appear for the post-TRY remainder.
-    let replayed_has_fallback = out2.replayed[0].iter().any(|(_, op)| {
+    let replayed_has_fallback = revised_lines(&out2)[0].iter().any(|(_, op)| {
             matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("fallback.content"))
         });
     assert!(
         replayed_has_fallback,
         "replayed line must apply fallback.content for post-branch remainder, got: {:?}",
-        out2.replayed[0]
+        revised_lines(&out2)[0]
     );
 }
 
@@ -373,7 +373,7 @@ contexts:
     let mut state = ParseState::new(&ss.syntaxes()[0]);
 
     let out0 = state.parse_line("START\n", &ss).expect("parse START");
-    assert!(out0.replayed.is_empty());
+    assert!(out0.revised.is_none());
 
     // Feed 129 empty lines to exceed the 128-line limit.
     // The pruning warning fires during the filler line that crosses the threshold.
@@ -387,9 +387,9 @@ contexts:
     let out_fail = state.parse_line("FAIL\n", &ss).expect("parse FAIL");
     all_warnings.extend(out_fail.warnings);
     assert!(
-        out_fail.replayed.is_empty(),
+        out_fail.revised.is_none(),
         "branch point should have expired, but got replayed ops: {:?}",
-        out_fail.replayed
+        out_fail.revised
     );
     assert!(
         all_warnings
@@ -432,7 +432,7 @@ contexts:
     let mut state = ParseState::new(&ss.syntaxes()[0]);
 
     let out0 = state.parse_line("START\n", &ss).expect("parse START");
-    assert!(out0.replayed.is_empty());
+    assert!(out0.revised.is_none());
 
     // Feed exactly 127 filler lines so that FAIL lands on cur_line=128
     // (128 - 0 = 128 <= 128, so the branch point is still valid)
@@ -444,9 +444,9 @@ contexts:
 
     // Fire fail — branch point should still be alive at the boundary
     let out_fail = state.parse_line("FAIL\n", &ss).expect("parse FAIL");
-    all_warnings.extend(out_fail.warnings);
+    all_warnings.extend(out_fail.warnings.clone());
     assert!(
-        !out_fail.replayed.is_empty(),
+        out_fail.revised.is_some(),
         "branch point should still be valid at exactly 128 lines, but got no replayed ops"
     );
     assert!(
@@ -454,13 +454,13 @@ contexts:
         "expected no warnings at the 128-line boundary, got: {:?}",
         all_warnings
     );
-    let has_fallback = out_fail.replayed[0].iter().any(|(_, op)| {
+    let has_fallback = revised_lines(&out_fail)[0].iter().any(|(_, op)| {
             matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("fallback.content"))
         });
     assert!(
         has_fallback,
         "expected fallback.content in replayed ops, got: {:?}",
-        out_fail.replayed[0]
+        revised_lines(&out_fail)[0]
     );
 }
 
@@ -589,37 +589,37 @@ contexts:
     let mut state = ParseState::new(&ss.syntaxes()[0]);
 
     let out1 = state.parse_line("TRY\n", &ss).expect("line 1");
-    assert!(out1.replayed.is_empty());
+    assert!(out1.revised.is_none());
 
     let out2 = state.parse_line("aaa\n", &ss).expect("line 2");
-    assert!(out2.replayed.is_empty());
+    assert!(out2.revised.is_none());
 
     let out3 = state.parse_line("bbb\n", &ss).expect("line 3");
-    assert!(out3.replayed.is_empty());
+    assert!(out3.revised.is_none());
 
     // Line 4: "FAIL" triggers cross-line backtrack; lines 1-3 should be replayed
     let out4 = state.parse_line("FAIL\n", &ss).expect("line 4");
     assert_eq!(
-        out4.replayed.len(),
+        revised_lines(&out4).len(),
         3,
         "expected 3 replayed lines (lines 1-3), got {:?}",
-        out4.replayed
+        out4.revised
     );
 
     // The first replayed line (replay of "TRY\n") should have fallback.content
     // because fallback-ctx matches `.*`. After that pop, lines 2-3 are parsed
     // by main, which matches `.*` → main.other.
-    let has_fallback = out4.replayed[0].iter().any(|(_, op)| {
+    let has_fallback = revised_lines(&out4)[0].iter().any(|(_, op)| {
             matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("fallback.content"))
         });
     assert!(
         has_fallback,
         "replayed line 0 missing fallback.content, got: {:?}",
-        out4.replayed[0]
+        revised_lines(&out4)[0]
     );
 
     // No replayed line should have try.word (all are under fallback path)
-    for (i, line_ops) in out4.replayed.iter().enumerate() {
+    for (i, line_ops) in revised_lines(&out4).iter().enumerate() {
         let has_try_word = line_ops.iter().any(|(_, op)| {
                 matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("try.word"))
             });
@@ -674,7 +674,7 @@ contexts:
 
     // Line 1: start the branch
     let out1 = state.parse_line("TRY\n", &ss).expect("line 1");
-    assert!(out1.replayed.is_empty());
+    assert!(out1.revised.is_none());
 
     // Line 2: "stuff FAIL" — "stuff" matches try.word (ops non-empty, start advances)
     // then FAIL triggers cross-line backtrack.
@@ -682,20 +682,20 @@ contexts:
 
     // Should have replayed line 1 (TRY\n)
     assert_eq!(
-        out2.replayed.len(),
+        revised_lines(&out2).len(),
         1,
         "expected 1 replayed line, got {}",
-        out2.replayed.len()
+        revised_lines(&out2).len()
     );
 
     // Replayed line should have fallback.content, not try.word
-    let replay_has_fallback = out2.replayed[0].iter().any(|(_, op)| {
+    let replay_has_fallback = revised_lines(&out2)[0].iter().any(|(_, op)| {
             matches!(op, ScopeStackOp::Push(s) if format!("{:?}", s).contains("fallback.content"))
         });
     assert!(
         replay_has_fallback,
         "replayed line should have fallback.content, got: {:?}",
-        out2.replayed[0]
+        revised_lines(&out2)[0]
     );
 
     // Current-line ops must NOT contain try.word (stale ops were cleared)
@@ -769,10 +769,10 @@ contexts:
     let mut state = ParseState::new(&ss.syntaxes()[0]);
 
     let out1 = state.parse_line("AB\n", &ss).expect("line 1");
-    assert!(out1.replayed.is_empty());
+    assert!(out1.revised.is_none());
 
     let out2 = state.parse_line("FOO\n", &ss).expect("line 2");
-    assert!(out2.replayed.is_empty());
+    assert!(out2.revised.is_none());
 
     // Line 3 fires `fail: bp2` twice (once for alt[1], once to exhaust)
     // and then `fail: bp1` — three cross-line fails back-to-back.
@@ -781,18 +781,18 @@ contexts:
     // Invariant: one replayed entry per buffered pending line (2), not
     // `number_of_fails × pending_lines`.
     assert_eq!(
-        out3.replayed.len(),
+        revised_lines(&out3).len(),
         2,
         "expected exactly 2 replayed lines (one per buffered pending line), got {}: {:?}",
-        out3.replayed.len(),
-        out3.replayed,
+        revised_lines(&out3).len(),
+        out3.revised,
     );
 
     // Panic guard: each `replayed[i]`'s byte offsets must fit within the
     // corresponding buffered line's length. The original misalignment
     // paired line 617's ops (77 bytes) with line 609's text (59 bytes).
     let line_lens = ["AB\n".len(), "FOO\n".len()];
-    for (i, line_ops) in out3.replayed.iter().enumerate() {
+    for (i, line_ops) in revised_lines(&out3).iter().enumerate() {
         for (pos, op) in line_ops {
             assert!(
                 *pos <= line_lens[i],
@@ -853,13 +853,13 @@ contexts:
     assert!(line1.find('B').unwrap() > "FAIL2\n".len());
 
     let out1 = state.parse_line(line1, &ss).expect("line 1 parses");
-    assert!(out1.replayed.is_empty());
+    assert!(out1.revised.is_none());
 
     // First cross-line fail: swap bp1 → a2. During a2's replay of line 1,
     // `B` fires bp2 and records (with the fix) `line_number = 0` and
     // `pending_lines_snapshot_len = 0` — anchored to line 1, not line 2.
     let out2 = state.parse_line("FAIL1\n", &ss).expect("line 2 parses");
-    assert_eq!(out2.replayed.len(), 1, "bp1 replay covers line 1");
+    assert_eq!(revised_lines(&out2).len(), 1, "bp1 replay covers line 1");
 
     // Second cross-line fail: bp2 must be classified cross-line on this
     // outer line. With the fix it is (line 0 < line 2), so the handler
@@ -873,11 +873,11 @@ contexts:
     // Cross-line classification fired a second replay covering the
     // two buffered lines (line 1 + line 2).
     assert_eq!(
-        out3.replayed.len(),
+        revised_lines(&out3).len(),
         2,
         "expected replay from bp2's cross-line fail to cover both buffered lines, got {}: {:?}",
-        out3.replayed.len(),
-        out3.replayed,
+        revised_lines(&out3).len(),
+        out3.revised,
     );
 
     // Panic guard: every op offset in both `ops` and `replayed` must
@@ -892,7 +892,7 @@ contexts:
         );
     }
     let replay_lines = [line1, "FAIL1\n"];
-    for (i, line_ops) in out3.replayed.iter().enumerate() {
+    for (i, line_ops) in revised_lines(&out3).iter().enumerate() {
         for (pos, op) in line_ops {
             assert!(
                 *pos <= replay_lines[i].len(),
@@ -981,12 +981,12 @@ contexts:
     // bp2's cross-line replay covered both buffered lines (line 1
     // + line 2). Line 1 is the one that must keep its captures.
     assert_eq!(
-        out3.replayed.len(),
+        revised_lines(&out3).len(),
         2,
         "bp2 cross-line replay should cover line1 + line2, got {:?}",
-        out3.replayed,
+        out3.revised,
     );
-    let line1_ops = &out3.replayed[0];
+    let line1_ops = &revised_lines(&out3)[0];
 
     let pushes_keyword = line1_ops.iter().any(
         |(_, op)| matches!(op, ScopeStackOp::Push(s) if *s == Scope::new("keyword.k.rp").unwrap()),
@@ -1037,22 +1037,14 @@ fn back_to_back_lrds_clear_meta_scope_via_corrected_baseline() {
 
     for line in ["[foo]: first\n", "[foo]: second\n", "bar\n"] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                buffer[start_idx + i].stack_before = stack.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone()));
-                }
-            }
-            for (idx, c) in corrected {
-                buffer[idx].stack_before = c;
             }
         }
         let stack_before = stack.clone();
@@ -1101,7 +1093,7 @@ fn cross_line_pop_n_branch_point_alt_fail_unwinds_meta_scope() {
     // same-line fix) emits the popped contexts' Pop alongside the new
     // alternative's meta_scope push.
     //
-    // The consumer must apply `out.replayed` corrected ops the same
+    // The consumer must apply `out.revised` corrected ops the same
     // way `examples/syntest.rs` does: rewind to the buffered line's
     // pre-parse stack, replay the corrected ops in order, then apply
     // the current line's ops. This mirrors the LRD test above.
@@ -1118,22 +1110,14 @@ fn cross_line_pop_n_branch_point_alt_fail_unwinds_meta_scope() {
     let mut buffer: Vec<Record> = Vec::new();
     for line in ["@A.B\n", "class E {}\n"] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                buffer[start_idx + i].stack_before = stack.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone()));
-                }
-            }
-            for (idx, c) in corrected {
-                buffer[idx].stack_before = c;
             }
         }
         let stack_before = stack.clone();
@@ -1270,10 +1254,10 @@ fn multi_line_annotation_eol_pop_survives_outer_replay() {
         .unwrap();
     let mut state = ParseState::new(syntax);
     // Track the "effective" ops for each line. parse_line returns
-    // both fresh ops for the current line and replayed ops for
-    // prior lines whose original ops have been corrected; the
-    // replayed entries supersede earlier records, mirroring what
-    // the syntest harness does in `parsed_line_buffer`.
+    // both fresh ops for the current line and, after a cross-line
+    // backtrack, `revised` ops for prior lines; the revised entries
+    // supersede earlier records, mirroring what the syntest harness
+    // does in `parsed_line_buffer`.
     let mut effective: Vec<Vec<(usize, ScopeStackOp)>> = Vec::new();
     let mut start_indices: Vec<usize> = Vec::new();
     let lines = [
@@ -1288,10 +1272,10 @@ fn multi_line_annotation_eol_pop_survives_outer_replay() {
     ];
     for line in lines {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let start = effective.len() - out.replayed.len();
-            for (i, replayed_ops) in out.replayed.into_iter().enumerate() {
-                effective[start + i] = replayed_ops;
+        if let Some(revised) = out.revised {
+            let start = effective.len() - revised.len();
+            for (i, revised_ops) in revised.into_iter().enumerate() {
+                effective[start + i] = revised_ops;
             }
         }
         effective.push(out.ops);
@@ -1352,10 +1336,10 @@ fn lrd_blank_line_keeps_meta_scope_active() {
         let out = state.parse_line(line, &ss).expect("parse");
         // Replay handling: reset baseline to pre-first-replayed-line state,
         // then apply replay ops in order to rebuild the live baseline.
-        if !out.replayed.is_empty() {
-            let start_idx = buffered_lines.len() - out.replayed.len();
+        if out.revised.is_some() {
+            let start_idx = buffered_lines.len() - revised_lines(&out).len();
             baseline = buffered_lines[start_idx].2.clone();
-            for (i, replay_ops) in out.replayed.iter().enumerate() {
+            for (i, replay_ops) in revised_lines(&out).iter().enumerate() {
                 for (_, op) in replay_ops {
                     let _ = baseline.apply(op);
                 }
@@ -1437,7 +1421,7 @@ fn cross_line_all_exhaust_with_pop_count_emits_popped_meta_scope_pops() {
     // (`deeper_inner_bp_correction_does_not_double_outer_meta_scope`)
     // protects against.
     //
-    // Test setup applies `out.replayed` corrected ops via the same
+    // Test setup applies `out.revised` corrected ops via the same
     // consumer pattern as
     // `cross_line_pop_n_branch_point_alt_fail_unwinds_meta_scope`,
     // then samples the corrected stack at byte 0 of line 1 (`@`).
@@ -1455,27 +1439,16 @@ fn cross_line_all_exhaust_with_pop_count_emits_popped_meta_scope_pops() {
     let mut buffer: Vec<Record> = Vec::new();
     for line in ["@Anno\n", ".\n", "Anno\n", "(par=1)\n", "enum E {}\n"] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                // Capture the replayed ops for this index so a later
-                // sample can reconstruct the line's running stack.
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();
@@ -1537,25 +1510,16 @@ fn cross_line_chained_fail_swaps_leaf_scope_on_buffered_line() {
     let mut buffer: Vec<Record> = Vec::new();
     for line in ["@Anno\n", ".\n", "Anno\n", "(par=1)\n", "enum E {}\n"] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();
@@ -1634,25 +1598,16 @@ fn cross_line_chained_fail_pushes_target_meta_scope_on_continuation_line() {
         "enum E {}\n",
     ] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();
@@ -1726,25 +1681,16 @@ fn cross_line_chained_fail_pushes_target_meta_scope_on_inline_continuation() {
     let mut buffer: Vec<Record> = Vec::new();
     for line in ["@Anno\n", ".\n", "Anno\n", "(par=1)\n", "enum E {}\n"] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();
@@ -1841,25 +1787,16 @@ fn cross_line_path_field_type_keeps_meta_path_on_continuation_line() {
         "}\n",
     ] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();
@@ -1939,25 +1876,16 @@ fn inline_path_field_type_keeps_meta_path_when_uninterrupted() {
     //                 2=`}`.
     for line in ["class C {\n", "  fully.qualified.string foo;\n", "}\n"] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();
@@ -2064,25 +1992,16 @@ fn cross_line_alternative_replacement_substitution_does_not_double_meta_scope() 
         "}\n",
     ] {
         let out = state.parse_line(line, &ss).expect("parse");
-        if !out.replayed.is_empty() {
-            let buf_len = buffer.len();
-            let start_idx = buf_len - out.replayed.len();
+        if let Some(revised) = &out.revised {
+            let start_idx = buffer.len() - revised.len();
             stack = buffer[start_idx].stack_before.clone();
-            let mut corrected: Vec<(usize, ScopeStack, Vec<(usize, ScopeStackOp)>)> = Vec::new();
-            for (i, replayed_ops) in out.replayed.iter().enumerate() {
-                for (_, op) in replayed_ops {
+            for (i, revised_ops) in revised.iter().enumerate() {
+                let rec = &mut buffer[start_idx + i];
+                rec.stack_before = stack.clone();
+                rec.ops = revised_ops.clone();
+                for (_, op) in revised_ops {
                     let _ = stack.apply(op);
                 }
-                let next_idx = start_idx + i + 1;
-                if next_idx < buf_len {
-                    corrected.push((next_idx, stack.clone(), replayed_ops.clone()));
-                }
-                if let Some(rec) = buffer.get_mut(start_idx + i) {
-                    rec.ops = replayed_ops.clone();
-                }
-            }
-            for (idx, c_stack, _) in corrected {
-                buffer[idx].stack_before = c_stack;
             }
         }
         let stack_before = stack.clone();

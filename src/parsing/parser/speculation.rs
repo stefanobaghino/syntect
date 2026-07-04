@@ -549,10 +549,8 @@ impl ParseState {
         // Check validity: not >128 lines old
         if cur_line.saturating_sub(bp.line_number) > 128 {
             let bp = self.branch_points.remove(bp_index);
-            self.warnings.push(format!(
-                "branch point '{}' expired (exceeded 128-line rewind limit)",
-                bp.name
-            ));
+            self.warnings
+                .push(ParseWarning::BranchPointExpired { name: bp.name });
             return Ok(false);
         }
 

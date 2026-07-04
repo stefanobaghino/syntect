@@ -377,7 +377,7 @@ contexts:
 
     // Feed 129 empty lines to exceed the 128-line limit.
     // The pruning warning fires during the filler line that crosses the threshold.
-    let mut all_warnings: Vec<String> = Vec::new();
+    let mut all_warnings: Vec<ParseWarning> = Vec::new();
     for _ in 0..129 {
         let out = state.parse_line("\n", &ss).expect("parse filler");
         all_warnings.extend(out.warnings);
@@ -394,7 +394,7 @@ contexts:
     assert!(
         all_warnings
             .iter()
-            .any(|w| w.contains("expired") && w.contains("bp")),
+            .any(|w| matches!(w, ParseWarning::BranchPointExpired { name } if name == "bp")),
         "expected a warning about branch point expiry, got: {:?}",
         all_warnings
     );
@@ -436,7 +436,7 @@ contexts:
 
     // Feed exactly 127 filler lines so that FAIL lands on cur_line=128
     // (128 - 0 = 128 <= 128, so the branch point is still valid)
-    let mut all_warnings: Vec<String> = Vec::new();
+    let mut all_warnings: Vec<ParseWarning> = Vec::new();
     for _ in 0..127 {
         let out = state.parse_line("\n", &ss).expect("parse filler");
         all_warnings.extend(out.warnings);

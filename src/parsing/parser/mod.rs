@@ -72,7 +72,46 @@ pub struct ParseLineOutput {
     /// Non-empty only when a cross-line `fail` just resolved.
     pub replayed: Vec<Vec<(usize, ScopeStackOp)>>,
     /// Warnings collected during parsing (e.g. branch point expiry).
-    pub warnings: Vec<String>,
+    pub warnings: Vec<ParseWarning>,
+}
+
+/// A non-fatal problem encountered while parsing a line, reported through
+/// [`ParseLineOutput::warnings`]. The parse result is still usable; the
+/// warning flags that a `branch_point` was resolved by force rather than
+/// by its syntax's own `fail` logic, so some scopes may not match what
+/// Sublime Text would produce.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ParseWarning {
+    /// A `branch_point` stayed unresolved for more than 128 lines and was
+    /// finalized on its current alternative; a later `fail` naming it is
+    /// ignored.
+    BranchPointExpired {
+        /// The `branch_point` name from the syntax definition.
+        name: String,
+    },
+    /// A single `parse_line` call exceeded its backtracking budget and
+    /// committed the current parse instead of exploring further
+    /// alternatives.
+    SpeculationBudgetExhausted {
+        /// The `branch_point` whose `fail` would have exceeded the budget.
+        name: String,
+    },
+}
+
+impl std::fmt::Display for ParseWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseWarning::BranchPointExpired { name } => write!(
+                f,
+                "branch point '{name}' expired (exceeded 128-line rewind limit)"
+            ),
+            ParseWarning::SpeculationBudgetExhausted { name } => write!(
+                f,
+                "speculation budget exhausted at branch point '{name}'; committing current parse"
+            ),
+        }
+    }
 }
 
 /// Maximum number of times a zero-width escape match can fire at the
@@ -139,7 +178,7 @@ pub struct ParseState {
     #[cfg(feature = "legacy-engine")]
     flushed_ops_bp_per_slot: Vec<BpInfo>,
     /// Warnings accumulated during parsing, drained into `ParseLineOutput`.
-    warnings: Vec<String>,
+    warnings: Vec<ParseWarning>,
     /// Mirror of the consumer's scope stack. Updated at `parse_line`
     /// boundaries (not mid-line) from the returned `ops` and
     /// `replayed`, mirroring the consumer's behaviour (reset to the
@@ -461,10 +500,9 @@ impl ParseState {
         self.branch_points.retain(|bp| {
             let alive = cur_line.saturating_sub(bp.line_number) <= 128;
             if !alive {
-                warnings.push(format!(
-                    "branch point '{}' expired (exceeded 128-line rewind limit)",
-                    bp.name
-                ));
+                warnings.push(ParseWarning::BranchPointExpired {
+                    name: bp.name.clone(),
+                });
             }
             alive
         });

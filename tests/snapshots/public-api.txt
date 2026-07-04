@@ -1024,6 +1024,27 @@ impl core::marker::Sync for syntect::parsing::ParseSyntaxError
 impl core::marker::Unpin for syntect::parsing::ParseSyntaxError
 impl !core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::ParseSyntaxError
 impl !core::panic::unwind_safe::UnwindSafe for syntect::parsing::ParseSyntaxError
+#[non_exhaustive] pub enum syntect::parsing::ParseWarning
+pub syntect::parsing::ParseWarning::BranchPointExpired
+pub syntect::parsing::ParseWarning::BranchPointExpired::name: alloc::string::String
+pub syntect::parsing::ParseWarning::SpeculationBudgetExhausted
+pub syntect::parsing::ParseWarning::SpeculationBudgetExhausted::name: alloc::string::String
+impl core::clone::Clone for syntect::parsing::ParseWarning
+pub fn syntect::parsing::ParseWarning::clone(&self) -> syntect::parsing::ParseWarning
+impl core::cmp::Eq for syntect::parsing::ParseWarning
+impl core::cmp::PartialEq for syntect::parsing::ParseWarning
+pub fn syntect::parsing::ParseWarning::eq(&self, other: &syntect::parsing::ParseWarning) -> bool
+impl core::fmt::Debug for syntect::parsing::ParseWarning
+pub fn syntect::parsing::ParseWarning::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for syntect::parsing::ParseWarning
+pub fn syntect::parsing::ParseWarning::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for syntect::parsing::ParseWarning
+impl core::marker::Freeze for syntect::parsing::ParseWarning
+impl core::marker::Send for syntect::parsing::ParseWarning
+impl core::marker::Sync for syntect::parsing::ParseWarning
+impl core::marker::Unpin for syntect::parsing::ParseWarning
+impl core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::ParseWarning
+impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::ParseWarning
 #[non_exhaustive] pub enum syntect::parsing::ParsingError
 pub syntect::parsing::ParsingError::BadMatchIndex(usize)
 pub syntect::parsing::ParsingError::MissingContext(syntect::parsing::syntax_definition::ContextId)
@@ -1100,7 +1121,7 @@ impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::MatchPower
 pub struct syntect::parsing::ParseLineOutput
 pub syntect::parsing::ParseLineOutput::ops: alloc::vec::Vec<(usize, syntect::parsing::ScopeStackOp)>
 pub syntect::parsing::ParseLineOutput::replayed: alloc::vec::Vec<alloc::vec::Vec<(usize, syntect::parsing::ScopeStackOp)>>
-pub syntect::parsing::ParseLineOutput::warnings: alloc::vec::Vec<alloc::string::String>
+pub syntect::parsing::ParseLineOutput::warnings: alloc::vec::Vec<syntect::parsing::ParseWarning>
 impl core::clone::Clone for syntect::parsing::ParseLineOutput
 pub fn syntect::parsing::ParseLineOutput::clone(&self) -> syntect::parsing::ParseLineOutput
 impl core::default::Default for syntect::parsing::ParseLineOutput

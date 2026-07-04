@@ -163,10 +163,9 @@ impl ParseState {
         self.trail.live.retain(|b| {
             let alive = cur_line.saturating_sub(b.created_line) <= 128;
             if !alive {
-                warnings.push(format!(
-                    "branch point '{}' expired (exceeded 128-line rewind limit)",
-                    b.name
-                ));
+                warnings.push(ParseWarning::BranchPointExpired {
+                    name: b.name.clone(),
+                });
             }
             alive
         });
@@ -504,9 +503,10 @@ impl ParseState {
 
         let budget = RESTART_BUDGET_PER_WINDOW_LINE * self.trail.lines.len();
         if self.trail.restarts >= budget {
-            self.warnings.push(format!(
-                "speculation budget exhausted at branch point '{name}'; committing current parse"
-            ));
+            self.warnings
+                .push(ParseWarning::SpeculationBudgetExhausted {
+                    name: name.to_string(),
+                });
             self.trail.live.clear();
             return false;
         }

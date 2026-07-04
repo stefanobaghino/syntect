@@ -3727,7 +3727,7 @@ mod tests {
     use crate::util::debug_print_ops;
     use crate::utils::testdata;
 
-    const TEST_SYNTAX: &str = include_str!("../../testdata/parser_tests.sublime-syntax");
+    const TEST_SYNTAX: &str = include_str!("../../../testdata/parser_tests.sublime-syntax");
     #[test]
     fn can_parse_simple() {
         let ss = &*testdata::PACKAGES_SYN_SET;
@@ -4155,7 +4155,7 @@ contexts:
     #[test]
     fn can_parse_issue120() {
         let syntax = SyntaxDefinition::load_from_str(
-            include_str!("../../testdata/embed_escape_test.sublime-syntax"),
+            include_str!("../../../testdata/embed_escape_test.sublime-syntax"),
             false,
             None,
         )

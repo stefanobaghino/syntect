@@ -1,4 +1,5 @@
-//! Branch-point speculation: corrected-op arbitration after a `fail`
+//! Branch-point speculation for the legacy op-correction engine
+//! (`legacy-engine` feature): corrected-op arbitration after a `fail`
 //! (`merge_flushed`, `prefer_inner_replay_corrections`) and the
 //! backtracking entry point itself (`handle_fail`).
 

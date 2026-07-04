@@ -1072,7 +1072,7 @@ fn back_to_back_lrds_clear_meta_scope_via_corrected_baseline() {
     );
     // The shadow stack is a legacy-engine internal (the trail engine
     // has no consumer mirror to drift).
-    #[cfg(not(feature = "trail-engine"))]
+    #[cfg(feature = "legacy-engine")]
     {
         let shadow_leaked = state.shadow.as_slice().contains(&lrd);
         assert!(
@@ -1159,7 +1159,7 @@ fn cross_line_pop_n_branch_point_alt_fail_unwinds_meta_scope() {
     );
     // The shadow stack is a legacy-engine internal (the trail engine
     // has no consumer mirror to drift).
-    #[cfg(not(feature = "trail-engine"))]
+    #[cfg(feature = "legacy-engine")]
     assert!(
         !state.shadow.as_slice().contains(&ann),
         "syntect shadow still carries meta.annotation.identifier.java; \

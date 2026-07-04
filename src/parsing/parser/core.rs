@@ -230,9 +230,9 @@ impl ParseState {
             // decision trail before anything is emitted or consumed, so
             // a `Refuse` decision can suppress the pattern entirely and
             // a restart can resume from this exact point.
-            #[cfg(feature = "trail-engine")]
+            #[cfg(not(feature = "legacy-engine"))]
             let mut empty_line_resume = false;
-            #[cfg(feature = "trail-engine")]
+            #[cfg(not(feature = "legacy-engine"))]
             if let MatchOperation::Branch {
                 ref name,
                 ref alternatives,
@@ -320,7 +320,7 @@ impl ParseState {
                 // inside link-title-continuation's exhaustion replay, then
                 // collapsing `meta.link.reference.def.markdown` on the empty
                 // line.
-                #[cfg(not(feature = "trail-engine"))]
+                #[cfg(feature = "legacy-engine")]
                 if matches!(match_pattern.operation, MatchOperation::Branch { .. })
                     && self.replay_ctx.is_some()
                     && match_end >= line.len()
@@ -357,7 +357,7 @@ impl ParseState {
                 search_cache,
             )?;
 
-            #[cfg(feature = "trail-engine")]
+            #[cfg(not(feature = "legacy-engine"))]
             if empty_line_resume {
                 *start = line.len();
             }
@@ -660,12 +660,12 @@ impl ParseState {
 
         // The trail engine's fail path doesn't rewind in place, so the
         // executor-local cursor state stays untouched here.
-        #[cfg(feature = "trail-engine")]
+        #[cfg(not(feature = "legacy-engine"))]
         let _ = (&start, &non_consuming_push_at, &search_cache);
 
         // Handle Fail: attempt backtracking
         if let MatchOperation::Fail(ref name) = pat.operation {
-            #[cfg(not(feature = "trail-engine"))]
+            #[cfg(feature = "legacy-engine")]
             return self.handle_fail(
                 name,
                 line,
@@ -675,7 +675,7 @@ impl ParseState {
                 search_cache,
                 syntax_set,
             );
-            #[cfg(feature = "trail-engine")]
+            #[cfg(not(feature = "legacy-engine"))]
             {
                 // Whether the fail scheduled a restart or was a no-op,
                 // stop the token loop; the window driver takes over.
@@ -698,15 +698,15 @@ impl ParseState {
                 // Trail engine: the alternative was chosen by
                 // `decide_branch` in `parse_next_token`; no snapshot is
                 // taken here — the decision's checkpoint carries it.
-                #[cfg(feature = "trail-engine")]
+                #[cfg(not(feature = "legacy-engine"))]
                 let chosen_alt = {
                     let _ = name;
                     self.take_pending_alt()
                         .expect("branch reached exec_pattern without a trail decision")
                 };
-                #[cfg(not(feature = "trail-engine"))]
+                #[cfg(feature = "legacy-engine")]
                 let chosen_alt = 0;
-                #[cfg(not(feature = "trail-engine"))]
+                #[cfg(feature = "legacy-engine")]
                 {
                     // Snapshot current state.
                     //

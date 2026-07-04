@@ -39,7 +39,7 @@ impl ParseState {
         // stack) plus the ops emitted so far on the current line. The
         // trail engine reconstructs it exactly from the committed stack
         // at the window base plus the window's provisional ops.
-        #[cfg(not(feature = "trail-engine"))]
+        #[cfg(feature = "legacy-engine")]
         let consumer_depth = {
             let mut current_shadow = self.shadow.clone();
             for (_, op) in ops.iter() {
@@ -47,7 +47,7 @@ impl ParseState {
             }
             current_shadow.as_slice().len()
         };
-        #[cfg(feature = "trail-engine")]
+        #[cfg(not(feature = "legacy-engine"))]
         let consumer_depth = self.window_consumer_depth(ops);
         let expected_depth: usize = {
             let mut total = 0usize;
@@ -142,7 +142,7 @@ impl ParseState {
         // snapshot captures the pre-pop depth doesn't false-prune itself.
         // (Trail engine: the post-token `prune_dead_branches` hook covers
         // this site.)
-        #[cfg(not(feature = "trail-engine"))]
+        #[cfg(feature = "legacy-engine")]
         {
             let stack_len = self.core.stack.len();
             self.branch_points

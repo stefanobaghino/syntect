@@ -1,4 +1,4 @@
-//! Trail-based speculation engine (`trail-engine` feature): checkpoint the
+//! Trail-based speculation engine (the default): checkpoint the
 //! interpreter state before every branch decision, log the decision on a
 //! trail, and handle `fail` by bumping the most recent live same-name
 //! decision and deterministically re-executing the buffered window from

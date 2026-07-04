@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use getopts::Options;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseLineOutput, ParseState, ScopeStack, SyntaxSet, SyntaxSetBuilder};
@@ -86,6 +86,17 @@ fn fold_line(
         col += len;
     }
     Ok(folded)
+}
+
+/// Hidden files and directories are environment, not corpus: a submodule's
+/// `.git` is a pointer file whose content is checkout-specific and would
+/// make dumps from different clones incomparable.
+fn is_hidden(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map(|s| s.starts_with('.'))
+        .unwrap_or(false)
 }
 
 enum FileOutcome {
@@ -225,6 +236,7 @@ fn main() {
     for entry in WalkDir::new(target_path)
         .sort_by_file_name()
         .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !is_hidden(e))
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
     {

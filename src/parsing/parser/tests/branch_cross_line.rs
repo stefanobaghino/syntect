@@ -124,7 +124,9 @@ contexts:
 /// test is a targeted end-to-end probe; the real reproduction lives
 /// in `testdata/Packages/JavaScript/tests/syntax_test_js.js` and
 /// `syntax_test_typescript.ts`, where nested cross-line branching
-/// previously panicked at `parser.rs:1014`. The guard leaves the
+/// previously panicked on `handle_fail`'s bare `bp_index` indexing
+/// (since guarded — see `ops_snapshot_len` reset in `speculation.rs`).
+/// The guard leaves the
 /// scope-op stream consistent enough for the syntest harness's
 /// `catch_unwind` to report a file-level `PANIC` rather than
 /// crashing the whole run — it does not attempt to produce
@@ -143,8 +145,8 @@ fn cross_line_fail_with_nested_branch_does_not_panic() {
     let content = std::fs::read_to_string(path).unwrap();
     let mut state = ParseState::new(syntax);
     // Wrap in catch_unwind so a later unrelated panic from the
-    // replay-consistency issue doesn't mask the parser.rs:1014
-    // regression we care about.
+    // replay-consistency issue doesn't mask the handle_fail
+    // bp_index regression we care about.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         for line in content.lines() {
             let mut s = line.to_string();
@@ -154,7 +156,7 @@ fn cross_line_fail_with_nested_branch_does_not_panic() {
     }));
     if let Err(payload) = result {
         // Extract the panic message and assert it is NOT the
-        // bp_index out-of-bounds at parser.rs:1014.
+        // bp_index out-of-bounds in handle_fail.
         let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
             (*s).to_string()
         } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -2031,9 +2033,11 @@ fn cross_line_alternative_replacement_substitution_does_not_double_meta_scope() 
     //
     // Combines the cluster-B failing probe's fixture
     // (`cross_line_path_field_type_keeps_meta_path_on_continuation_line`
-    // at `parser.rs:11297+`) with the multigen16 sentinel's
+    // in this module) with the multigen16 sentinel's
     // continuation lines (`/**/ . /**/` and `@anno /**/ object
-    // @anno()` from `parser.rs:9617+`'s fixture) and a closing
+    // @anno()` from
+    // `deeper_inner_bp_correction_does_not_double_outer_meta_scope`'s
+    // fixture) and a closing
     // `string foo; }` to settle the parser. Line 4 (the
     // `@anno /**/ object @anno()` line) triggers the cross-line
     // fail-replay that exercises iter-3's substitution candidate
@@ -2101,7 +2105,7 @@ fn cross_line_alternative_replacement_substitution_does_not_double_meta_scope() 
     }
     for (name, count) in &counts {
         // Iter 7 relaxation: `meta.class.java` is exempt because
-        // iter-7-pre-2 (deferral prose at `parser.rs:11521+`)
+        // iter-7-pre-2 analysis
         // identified its doubling as a baseline parser bug at
         // parse_line[2]'s drain — exposed by, but not caused by,
         // iter-3's substitution. Comp-pop v3 + G2 gate (the

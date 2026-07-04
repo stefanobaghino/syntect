@@ -178,7 +178,8 @@ pub struct ParseState {
     /// across nested inner replays via `mem::replace` (mirrors
     /// `saved_flushed`). `None` outside an inner replay; `Some(default)`
     /// at the start of one. Cluster-B candidate-#2 diagnostic
-    /// (probe prose at `parser.rs:10767+`).
+    /// (probe assertions in
+    /// `cross_line_path_field_type_keeps_meta_path_on_continuation_line`).
     inner_replay_max_depth: Option<MaxDepthSeen>,
     /// Per-line count of zero-width escape fires keyed by byte
     /// position. Once the count at a position exceeds

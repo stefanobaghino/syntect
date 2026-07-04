@@ -85,7 +85,7 @@ impl ParseState {
                 // slots' `inner_producer` chains carry the AQI depth
                 // forward
                 // (`cross_line_chained_fail_pushes_target_meta_scope_on_continuation_line`,
-                // probe prose at `parser.rs:10270`+).
+                // whose doc comment carries the probe rationale).
                 let prior_ops = std::mem::take(&mut self.flushed_ops);
                 let prior_bp = std::mem::take(&mut self.flushed_ops_bp_per_slot);
                 let prior_len = prior_ops.len();
@@ -261,7 +261,9 @@ impl ParseState {
                     // outer_local with inner's corrected ops. If the
                     // substitution would over-push a `meta.*` atom not
                     // already on the running shadow stack (G2 discriminator
-                    // — see deferral prose at `parser.rs:11363+`), append a
+                    // — deferral rationale in the iter-7 notes of
+                    // `cross_line_alternative_replacement_substitution_does_not_double_meta_scope`),
+                    // append a
                     // compensating Pop(1) immediately after each over-pushed
                     // Push so the consumer's stack mirror sees the
                     // intended single push without doubling.
@@ -329,9 +331,9 @@ impl ParseState {
                         // (`meta.function.*` family inner correctly
                         // omits) but the symmetric predicate widening
                         // surfaced inner-BP stack-base misalignment
-                        // first — see iter-9 prose at `parser.rs:11968+`
-                        // for the deferral rationale and iter 9.5
-                        // discriminator requirements.
+                        // first, so the widening stays deferred;
+                        // `is_replace_shape` documents the predicate
+                        // that did land.
                     } else {
                     }
                 }
@@ -457,7 +459,7 @@ impl ParseState {
             .all(|(pos, op)| *pos <= max_pos && matches!(op, ScopeStackOp::Pop(_)))
     }
 
-    /// Iter-19 (parser.rs:~12848 prose) discriminator: should cross-line
+    /// Iter-19 discriminator: should cross-line
     /// `handle_fail` rewind to BP-creation snapshot and force alt 5 on
     /// re-entry? Composite signal — `class-members` name gate, not-
     /// already-alt-5 loop guard, empty inner corrections, max-depth BP

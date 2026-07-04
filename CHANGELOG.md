@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Migrating from 5.x
+
+- `ParseState::parse_line` now returns `Result<ParseLineOutput, ParsingError>`. For the old behavior, take `.ops` from the `Ok` value — it is the same op stream as before for syntaxes without `branch_point`s. For modern syntaxes that backtrack across lines, either use the new `CommittedParser` wrapper (yields each line's final ops exactly once) or handle `ParseLineOutput::revised` yourself: buffer lines while `ParseState::speculative_lines() > 0`, and on `revised` replace the buffered window wholesale, resetting your scope stack to the snapshot you took at the window base (which is guaranteed immutable).
+- Cache/clone `ParseState` at `speculative_lines() == 0` boundaries; states snapshotted there can never be invalidated by a later revision.
+- `HighlightLines` / `HighlightFile` are deprecated: port to `syntect::io::HighlightedWriter`, which buffers during speculation and applies revisions internally.
+- `line_tokens_to_classed_spans` is deprecated: use `ClassedHTMLGenerator` or `HighlightedWriter::from_markup`.
+- `SCOPE_REPO` is gone: use `Scope::with_atom_strs` to read atom strings.
+- Loader and parser warnings are typed (`LoadWarning`, `ParseWarning`) instead of strings; `Display` preserves the previous message text.
+- The minimum supported Rust version is declared via `rust-version` (currently 1.89; policy remains the last three stable releases).
+
 ### Breaking changes
 
 - `HighlightLines` and `HighlightFile` deprecated since 6.0.0 — use `syntect::io::HighlightedWriter` instead [#627]

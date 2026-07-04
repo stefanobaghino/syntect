@@ -18,6 +18,9 @@
 
 ### Improvements
 
+- `branch_point`/`fail` backtracking is now handled by a trail-based re-execution engine: the parser checkpoints before each branch decision and deterministically re-parses the buffered window on `fail`, instead of surgically correcting already-emitted ops [#699] [#700]
+- `ParseLineOutput` reports cross-line corrections through `revised`: when present, it wholesale-replaces the entire still-uncommitted window, and the parser state at the window base is guaranteed immutable, so consumers reset once to a snapshot they already hold. `ParseState::speculative_lines()` reports how many returned lines may still be revised (`0` = safe to flush or cache), and `warnings` are typed as `ParseWarning` [#700]
+- Add `CommittedParser`, a wrapper for batch consumers that hands back each line's ops exactly once — only when no future `fail` can revise them — with `finish()` draining the tail at end of input [#700]
 - Add `syntect::io` module containing `HighlightedWriter<'a, R, W>`, a streaming highlighter that implements `std::io::Write` and handles branch-point backtracking, generic over the output sink (`Vec<u8>` by default, or any `io::Write` for streaming). Constructed via the new `HighlightedWriterBuilder`: pick a renderer category with `HighlightedWriter::from_themed` / `from_markup` / `from_renderer`, then chain `.with_output(...)` / `.with_state(...)` and finish with `.build()`. End-of-input cleanup runs implicitly via `Drop` on a best-effort basis; call `into_inner` explicitly when you need the inner sink back or want errors propagated [#627]
 - Add `syntect::rendering` module with a layered renderer trait design [#627]:
     - `ScopeMarkup` — slim trait for stateless renderers that map scope structure 1:1 to output structure (e.g. CSS-classed HTML); receives only pre-resolved atom strings
@@ -43,6 +46,8 @@
 [#614]: https://github.com/trishume/syntect/pull/614
 [#615]: https://github.com/trishume/syntect/pull/615
 [#619]: https://github.com/trishume/syntect/pull/619
+[#699]: https://github.com/trishume/syntect/pull/699
+[#700]: https://github.com/trishume/syntect/pull/700
 [#627]: https://github.com/trishume/syntect/pull/627
 
 ## [Version 5.3.0](https://github.com/trishume/syntect/compare/v5.2.0...v5.3.0)

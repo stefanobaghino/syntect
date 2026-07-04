@@ -29,32 +29,44 @@ impl ParseState {
         // because a speculative `meta.path.java` atom pushed inside the
         // embedded Java shifts every subsequent Pop by one.
         //
+        // The drain also rebalances ordinary v2 `embed_scope` escapes:
+        // the embedded syntax's top-level scope is pushed at embed time
+        // yet excluded from the pop-side model below, so the consumer
+        // systematically holds one more atom than `expected_depth`.
+        //
+        // The consumer's actual depth is engine-specific. The legacy
+        // engine mirrors it in `shadow` (end-of-prior-line consumer
+        // stack) plus the ops emitted so far on the current line. The
+        // trail engine reconstructs it exactly from the committed stack
+        // at the window base plus the window's provisional ops.
         #[cfg(not(feature = "trail-engine"))]
-        {
+        let consumer_depth = {
             let mut current_shadow = self.shadow.clone();
             for (_, op) in ops.iter() {
                 let _ = current_shadow.apply(op);
             }
-            let consumer_depth = current_shadow.as_slice().len();
-            let expected_depth: usize = {
-                let mut total = 0usize;
-                let mut prev_embed_scope_replaces = false;
-                for lvl in &self.core.stack {
-                    let ctx = syntax_set.get_context(&lvl.context)?;
-                    total += ctx.meta_scope.len();
-                    if !prev_embed_scope_replaces {
-                        total += ctx.meta_content_scope.len();
-                    }
-                    prev_embed_scope_replaces = ctx.embed_scope_replaces;
+            current_shadow.as_slice().len()
+        };
+        #[cfg(feature = "trail-engine")]
+        let consumer_depth = self.window_consumer_depth(ops);
+        let expected_depth: usize = {
+            let mut total = 0usize;
+            let mut prev_embed_scope_replaces = false;
+            for lvl in &self.core.stack {
+                let ctx = syntax_set.get_context(&lvl.context)?;
+                total += ctx.meta_scope.len();
+                if !prev_embed_scope_replaces {
+                    total += ctx.meta_content_scope.len();
                 }
-                total
-            };
-            if consumer_depth > expected_depth {
-                ops.push((
-                    match_start,
-                    ScopeStackOp::Pop(consumer_depth - expected_depth),
-                ));
+                prev_embed_scope_replaces = ctx.embed_scope_replaces;
             }
+            total
+        };
+        if consumer_depth > expected_depth {
+            ops.push((
+                match_start,
+                ScopeStackOp::Pop(consumer_depth - expected_depth),
+            ));
         }
 
         // Pop all stack levels down to target_depth, emitting proper meta scope pops

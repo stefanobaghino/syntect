@@ -120,6 +120,12 @@ pub(super) struct TrailState {
     pending_backtrack: Option<usize>,
     /// Restarts consumed by the current `parse_line` call.
     restarts: usize,
+    /// The consumer's scope stack at the start of `lines[0]` — the fold
+    /// of every op committed before the window. Together with the
+    /// window's provisional ops this reconstructs the consumer's exact
+    /// stack at any execution point (see `window_consumer_depth`),
+    /// which `exec_escape` needs to rebalance v2 `embed_scope` atoms.
+    base_shadow: ScopeStack,
 }
 
 impl ParseState {
@@ -164,6 +170,11 @@ impl ParseState {
         // No live decisions means no future `fail` can revise the
         // window: commit it and start a fresh one at the current line.
         if self.trail.live.is_empty() {
+            for line_ops in &self.trail.provisional {
+                for (_, op) in line_ops {
+                    let _ = self.trail.base_shadow.apply(op);
+                }
+            }
             self.trail.lines.clear();
             self.trail.provisional.clear();
             self.trail.trail.clear();
@@ -303,6 +314,24 @@ impl ParseState {
         }
         self.prune_dead_branches();
         Ok(())
+    }
+
+    /// Depth of the consumer's scope stack at the current execution
+    /// point: the committed stack at the window base plus every op the
+    /// current execution has produced so far, up to and including `ops`
+    /// (the in-progress line's vec). Deterministic given the trail
+    /// prefix, so restarts recompute it identically.
+    pub(super) fn window_consumer_depth(&self, ops: &[(usize, ScopeStackOp)]) -> usize {
+        let mut stack = self.trail.base_shadow.clone();
+        for line_ops in &self.trail.provisional[..self.trail.exec_line_idx] {
+            for (_, op) in line_ops {
+                let _ = stack.apply(op);
+            }
+        }
+        for (_, op) in ops {
+            let _ = stack.apply(op);
+        }
+        stack.as_slice().len()
     }
 
     /// Finalize decisions whose alternative frame is no longer on the

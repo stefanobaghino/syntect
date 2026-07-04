@@ -19,35 +19,6 @@ impl ParseState {
         let target_depth = entry.stack_depth;
         let escape_captures = entry.captures.clone();
 
-        // Drain orphan scope atoms left on the consumer's scope stack by
-        // a prior cross-line replay whose later same-line fails
-        // truncated the owning context out of `self.core.stack` — the Push
-        // was committed to `flushed_ops` and can't be unwound by
-        // `ops.truncate`, so we emit a balancing Pop here. Without this,
-        // e.g. LaTeX `\end{lstlisting}` leaves
-        // `meta.environment.verbatim.lstlisting.latex` on the stack
-        // because a speculative `meta.path.java` atom pushed inside the
-        // embedded Java shifts every subsequent Pop by one.
-        //
-        // The drain also rebalances ordinary v2 `embed_scope` escapes:
-        // the embedded syntax's top-level scope is pushed at embed time
-        // yet excluded from the pop-side model below, so the consumer
-        // systematically holds one more atom than `expected_depth`.
-        //
-        // The consumer's actual depth is engine-specific. The legacy
-        // engine mirrors it in `shadow` (end-of-prior-line consumer
-        // stack) plus the ops emitted so far on the current line. The
-        // trail engine reconstructs it exactly from the committed stack
-        // at the window base plus the window's provisional ops.
-        #[cfg(feature = "legacy-engine")]
-        let consumer_depth = {
-            let mut current_shadow = self.shadow.clone();
-            for (_, op) in ops.iter() {
-                let _ = current_shadow.apply(op);
-            }
-            current_shadow.as_slice().len()
-        };
-        #[cfg(not(feature = "legacy-engine"))]
         let consumer_depth = self.window_consumer_depth(ops);
         let expected_depth: usize = {
             let mut total = 0usize;
@@ -133,21 +104,6 @@ impl ParseState {
 
         // Remove this escape entry and any inner (later) escape entries
         self.core.escape_stack.truncate(escape_idx);
-
-        // Invalidate branch points whose alt frame is no longer on the
-        // stack. This mirrors the `alt frame still present` predicate used
-        // at the other five BP-prune sites (handle_fail's late guard plus
-        // the Push/Set/Embed/Pop retain calls): subtracting the bp's own
-        // pop_count is necessary so a `pop: N + branch_point` whose
-        // snapshot captures the pre-pop depth doesn't false-prune itself.
-        // (Trail engine: the post-token `prune_dead_branches` hook covers
-        // this site.)
-        #[cfg(feature = "legacy-engine")]
-        {
-            let stack_len = self.core.stack.len();
-            self.branch_points
-                .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
-        }
 
         Ok(())
     }

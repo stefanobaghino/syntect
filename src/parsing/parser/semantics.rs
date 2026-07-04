@@ -878,9 +878,6 @@ impl ParseState {
                 };
                 if pop_count > 0 {
                     let final_len = self.core.stack.len() + ctx_refs.len();
-                    #[cfg(feature = "legacy-engine")]
-                    self.branch_points
-                        .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
                     self.core.escape_stack.retain(|e| e.stack_depth < final_len);
                 }
                 (ctx_refs, old_proto_ids, false)
@@ -895,9 +892,6 @@ impl ParseState {
                         self.core.stack.pop();
                     }
                     let stack_len = self.core.stack.len();
-                    #[cfg(feature = "legacy-engine")]
-                    self.branch_points
-                        .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
                     self.core.escape_stack.retain(|e| e.stack_depth < stack_len);
                 }
                 (contexts, None, true)
@@ -916,27 +910,13 @@ impl ParseState {
                 for _ in 1..pops {
                     self.core.stack.pop();
                 }
-                // Prune branch_points / escape_stack against the *final* stack
-                // length (after the common push loop below).
-                //
-                // The retain predicate must mirror `handle_fail`'s validity
-                // check (`stack.len() > bp.stack_depth - bp.pop_count`),
-                // which subtracts the bp's own `pop_count`. Without that
-                // subtraction, a `pop: N + branch_point` whose synthetic
-                // Set has `pop_count: N` removes its own freshly-created
-                // bp here — `bp.stack_depth` snapshots the *pre-pop*
-                // depth, so `bp.stack_depth > final_len` even though the
-                // alt-0 frame lives on at `final_len`. Symptom in Java:
-                // the `branch_point: annotation-qualified-parameters`
-                // declared on `annotation-qualified-identifier-name`'s
-                // `pop: 2 + branch_point` was dropped at creation,
-                // making its later `(?=\S)` `fail` a no-op and leaking
-                // `meta.annotation.identifier.java meta.path.java` past
-                // every nested-annotation extends path.
+                // Prune escape entries against the *final* stack length
+                // (after the common push loop below), not the mid-pop
+                // depth. (Live-branch pruning happens in the executor's
+                // post-token `prune_dead_branches` hook; its
+                // `LiveBranch::alive` predicate carries the matching
+                // `pop_count` subtlety for `pop: N + branch_point`.)
                 let final_len = self.core.stack.len() + ctx_refs.len();
-                #[cfg(feature = "legacy-engine")]
-                self.branch_points
-                    .retain(|bp| final_len > bp.stack_depth.saturating_sub(bp.pop_count));
                 self.core.escape_stack.retain(|e| e.stack_depth < final_len);
                 (ctx_refs, old_proto_ids, false)
             }
@@ -944,14 +924,8 @@ impl ParseState {
                 for _ in 0..n {
                     self.core.stack.pop();
                 }
-                // Invalidate branch points whose alt frame is no longer on
-                // the stack. Use the same threshold as `handle_fail`'s
-                // validity check — see the comment in the Set arm above.
-                let stack_len = self.core.stack.len();
-                #[cfg(feature = "legacy-engine")]
-                self.branch_points
-                    .retain(|bp| stack_len > bp.stack_depth.saturating_sub(bp.pop_count));
                 // Remove escape entries whose stack_depth >= current stack
+                let stack_len = self.core.stack.len();
                 self.core.escape_stack.retain(|e| e.stack_depth < stack_len);
                 return Ok(true);
             }

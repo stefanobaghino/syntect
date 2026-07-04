@@ -1,13 +1,13 @@
-//! Trail-based speculation engine (the default): checkpoint the
-//! interpreter state before every branch decision, log the decision on a
-//! trail, and handle `fail` by bumping the most recent live same-name
-//! decision and deterministically re-executing the buffered window from
-//! its checkpoint — instead of surgically correcting already-emitted ops
-//! the way the legacy engine in `speculation.rs` does.
+//! Trail-based speculation engine: checkpoint the interpreter state
+//! before every branch decision, log the decision on a trail, and handle
+//! `fail` by bumping the most recent live same-name decision and
+//! deterministically re-executing the buffered window from its
+//! checkpoint — instead of surgically correcting already-emitted ops the
+//! way syntect's original speculation engine did.
 //!
-//! The executor (`parse_next_token` and everything below it) is shared
-//! with the legacy engine and operates on [`Core`]; the only trail-aware
-//! points are branch-decision selection and `fail` handling.
+//! The executor (`parse_next_token` and everything below it) operates on
+//! [`Core`]; the only trail-aware points are branch-decision selection
+//! and `fail` handling.
 
 use super::*;
 
@@ -71,9 +71,8 @@ struct Decision {
     created_line: usize,
     /// Whether the most recent bump came from a `fail` on the
     /// decision's own line. Drives the empty-line pop placement rule
-    /// (the legacy engine's same-line fail path has the same
-    /// distinction — its cross-line replay path never relocates the
-    /// resume cursor).
+    /// (see `parse_next_token`) — only a same-line fail relocates the
+    /// resume cursor; cross-line bumps keep their natural position.
     bumped_same_line: bool,
     checkpoint: Checkpoint,
 }
@@ -92,8 +91,11 @@ struct LiveBranch {
 
 impl LiveBranch {
     /// The alternative's frame is still on the stack iff the stack is
-    /// deeper than the pre-branch depth minus the branch's own pops —
-    /// the same predicate the legacy engine uses at its prune sites.
+    /// deeper than the pre-branch depth minus the branch's own pops.
+    /// Subtracting `pop_count` matters for `pop: N + branch_point`:
+    /// the pre-branch depth is snapshotted before the branch's own
+    /// pops, so without the subtraction the decision would be judged
+    /// dead at its own creation.
     fn alive(&self, stack_len: usize) -> bool {
         stack_len > self.stack_depth.saturating_sub(self.pop_count)
     }
@@ -289,10 +291,10 @@ impl ParseState {
         Ok(())
     }
 
-    /// The per-line token loop: mirrors the legacy engine's
-    /// `parse_line_inner_from`, plus checkpoint-aware resume (caller
-    /// provides the ops prefix and the loop-guard state) and live-branch
-    /// pruning after every token.
+    /// The per-line token loop: first-line meta_content_scope emission,
+    /// then `parse_next_token` until the line is consumed, with
+    /// checkpoint-aware resume (the caller provides the ops prefix and
+    /// the loop-guard state) and live-branch pruning after every token.
     fn execute_line_from(
         &mut self,
         line: &str,
@@ -355,8 +357,8 @@ impl ParseState {
     }
 
     /// Finalize decisions whose alternative frame is no longer on the
-    /// stack. One post-token hook replaces the legacy engine's prune
-    /// sites in `perform_op` (Pop/Set/pop+push) and `exec_escape`.
+    /// stack — a single post-token hook, so no individual stack-popping
+    /// site (Pop/Set/pop+push/escape) needs its own prune.
     fn prune_dead_branches(&mut self) {
         if !self.trail.live.is_empty() {
             let stack_len = self.core.stack.len();
@@ -450,7 +452,7 @@ impl ParseState {
         Some((0, false))
     }
 
-    /// Port of the legacy engine's replay-time rule: during
+    /// Sublime Text-parity placement rule: during
     /// re-execution of an earlier window line, a non-consuming branch
     /// whose match lands past every character of the line must not
     /// anchor a decision there — the line's re-execution ends and the

@@ -1062,18 +1062,6 @@ fn back_to_back_lrds_clear_meta_scope_via_corrected_baseline() {
              LRDs into 'bar' paragraph; consumer stack at end: {:?}",
         stack,
     );
-    // The shadow stack is a legacy-engine internal (the trail engine
-    // has no consumer mirror to drift).
-    #[cfg(feature = "legacy-engine")]
-    {
-        let shadow_leaked = state.shadow.as_slice().contains(&lrd);
-        assert!(
-            !shadow_leaked,
-            "syntect shadow disagrees with corrected consumer stack; \
-             shadow at end: {:?}",
-            state.shadow,
-        );
-    }
 }
 
 #[cfg(feature = "default-onig")]
@@ -1141,20 +1129,15 @@ fn cross_line_pop_n_branch_point_alt_fail_unwinds_meta_scope() {
              top-level scope; final stack: {:?}",
         stack,
     );
-    // The shadow stack is a legacy-engine internal (the trail engine
-    // has no consumer mirror to drift).
-    #[cfg(feature = "legacy-engine")]
-    assert!(
-        !state.shadow.as_slice().contains(&ann),
-        "syntect shadow still carries meta.annotation.identifier.java; \
-             shadow: {:?}",
-        state.shadow,
-    );
 }
 
 #[cfg(feature = "default-onig")]
 #[test]
 fn deeper_inner_bp_correction_does_not_double_outer_meta_scope() {
+    // Meta-scope doubling sentinel. The narrative below describes the
+    // replaced op-correction engine that motivated the fixture; the
+    // no-doubling invariant it pins is ST-visible and engine-agnostic.
+    //
     // `class C { @anno /**/ fully\n. @anno qualified\n/**/ . /**/\n@anno /**/ object @anno()`
     // triggers a NESTED cross-line replay where the inner BP is
     // structurally a child of the outer BP's resolved alternative
@@ -1237,14 +1220,11 @@ fn deeper_inner_bp_correction_does_not_double_outer_meta_scope() {
 /// `immediately-pop2` failover when `final` (line 4) trips its
 /// `(?=\S)` probe. The inner commit's `meta.annotation.identifier`
 /// pop sits at the BP trigger position (col 11 of line 3 — the
-/// `\n` after `Number`), but `prefer_inner_replay_corrections`
-/// would discard it because the inner is several frames deeper
-/// than the outer (`object-type`-style depth gap). Substituting
-/// blindly regresses other Java constructs (lost
-/// `meta.enum.java`); the discriminator allows substitution only
-/// when the inner ops are an `immediately-pop`-style tail-extension
-/// of outer's (identical prefix + appended `Pop` ops at outer's
-/// covered positions).
+/// `\n` after `Number`). Under the replaced op-correction engine
+/// this required a dedicated tail-extension discriminator to accept
+/// the inner commit's corrections without regressing other Java
+/// constructs (lost `meta.enum.java`); the test remains as the
+/// ST-parity guard for that pop placement.
 #[test]
 #[ignore = "requires testdata/Packages submodule"]
 fn multi_line_annotation_eol_pop_survives_outer_replay() {
@@ -1407,19 +1387,12 @@ fn cross_line_all_exhaust_with_pop_count_emits_popped_meta_scope_pops() {
     // `(?={{single_dot}}) fail: annotation-identifier`, retrying alt 1
     // (`annotation-qualified-identifier`) cross-line. The qualified
     // alt has `meta_scope: meta.annotation.identifier.java
-    // meta.path.java`, which the cross-line replay's outer-locally-
-    // computed line-1 ops do NOT carry — outer (`declarations`)'s
-    // `parse_line_inner_from(line0, …)` re-parses line 1 under its
-    // resolved alt-1 stack and picks alt-0 (unqualified) of the inner
-    // `annotation-identifier` BP, only retrying to alt-1 (qualified)
-    // when line 2's `.` arrives during outer's replay of line 1.
-    // Inner's flushed corrections carry `meta.path.java`, and the
-    // refined depth-bounded gate in `prefer_inner_replay_corrections`
-    // (`depth_diff in {0, 1}`) substitutes them onto outer's locally
-    // computed ops while still skipping the deeper-inner case the
-    // doubling guard
-    // (`deeper_inner_bp_correction_does_not_double_outer_meta_scope`)
-    // protects against.
+    // meta.path.java`, and the ST-visible outcome this test pins is
+    // that the revision of line 1 carries both scopes at the `@` even
+    // though the alternatives resolve across two nested decisions on
+    // different lines (historically this required a dedicated
+    // corrected-op merge gate; whole-window re-execution produces it
+    // directly).
     //
     // Test setup applies `out.revised` corrected ops via the same
     // consumer pattern as
@@ -1739,10 +1712,9 @@ fn cross_line_chained_fail_pushes_target_meta_scope_on_inline_continuation() {
 }
 
 /// Asserts `meta.path.java` survives on the type-path of a multi-line qualified Java
-/// field declaration interrupted by `/**/` and EOL comments. Defends the
-/// `prefer_inner_replay_corrections` substitution path that fires when inner pushes a
-/// `meta.*` atom outer drops (`is_replace_shape`), with the comp-pop / G2 gate
-/// preventing meta-scope doubling. Mirrors `syntax_test_java.java:3395-3413`.
+/// field declaration interrupted by `/**/` and EOL comments (historically the
+/// op-correction engine's cluster-B substitution case). Mirrors
+/// `syntax_test_java.java:3395-3413`.
 #[cfg(feature = "default-onig")]
 #[test]
 fn cross_line_path_field_type_keeps_meta_path_on_continuation_line() {
@@ -2047,11 +2019,7 @@ fn cross_line_alternative_replacement_substitution_does_not_double_meta_scope() 
             *count <= 1,
             "meta.* scope `{}` must not be doubled on the running \
                  stack at the start of line 4 (`  /**/ . /**/`) inside \
-                 the cluster-B fixture continuation (count={}). Iter-3 \
-                 substitution at \
-                 `prefer_inner_replay_corrections`'s SkippedDeepNonExtension \
-                 branch (now production under Iter 7's G2 gate) must \
-                 not double any atom iter-3 actually substitutes. \
+                 the cluster-B fixture continuation (count={}). \
                  stack: {:?}",
             name,
             count,

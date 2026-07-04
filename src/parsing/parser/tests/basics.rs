@@ -512,7 +512,7 @@ fn non_consuming_multi_push_with_skip_unwind_does_not_loop() {
     // Pre-fix: parser hangs — K=3 push stored armed depth D+1, but
     // a multi-level pop chain (`pop:1` then `pop:2`) unwinds
     // D+3 → D+2 → D, never visiting D+1, so the loop guard never
-    // arms and `parse_line_inner_from` re-enters main's empty
+    // arms and the token loop re-enters main's empty
     // push forever. Under the fix the guard arms across the
     // half-open interval (D, D+K] and fires when a non-consuming
     // pop lands at exactly D, so b's `pop: 2` from depth D+2

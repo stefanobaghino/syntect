@@ -7,6 +7,7 @@ mod branch_same_line;
 mod committed;
 mod embed;
 mod meta_ops;
+mod properties;
 mod regressions;
 
 use super::*;

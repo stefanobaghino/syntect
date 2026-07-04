@@ -204,6 +204,10 @@ pub struct ParseState {
     /// cross-line replay reprocessing the same line offset starts
     /// fresh. Intentionally NOT snapshotted into `BranchPoint`.
     zero_width_escape_fires: HashMap<usize, u32>,
+    /// Trail-engine state: buffered window, per-line provisional ops,
+    /// and the decision trail. See the `trail` module.
+    #[cfg(feature = "trail-engine")]
+    trail: trail::TrailState,
 }
 
 /// Tracker installed on `ParseState` for the duration of an outer
@@ -351,6 +355,8 @@ mod core;
 mod embed;
 mod semantics;
 mod speculation;
+#[cfg(feature = "trail-engine")]
+mod trail;
 #[cfg(feature = "yaml-load")]
 #[cfg(test)]
 mod tests;
@@ -385,6 +391,8 @@ impl ParseState {
             skipped_branches: Vec::new(),
             inner_replay_max_depth: None,
             zero_width_escape_fires: HashMap::default(),
+            #[cfg(feature = "trail-engine")]
+            trail: trail::TrailState::default(),
         }
     }
 

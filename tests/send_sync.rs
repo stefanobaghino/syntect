@@ -18,7 +18,6 @@ const PARSING: fn() = || {
     assert_send_sync::<syntect::parsing::SyntaxReference>();
     assert_send_sync::<syntect::parsing::ParseLineOutput>();
     assert_send_sync::<syntect::parsing::ParseWarning>();
-    assert_send_sync::<syntect::parsing::LoadWarning>();
     assert_send_sync::<syntect::parsing::ScopeStack>();
     assert_send_sync::<syntect::parsing::Scope>();
 };

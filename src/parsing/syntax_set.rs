@@ -20,77 +20,6 @@ use crate::parsing::syntax_definition::ContextId;
 use serde_derive::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// A non-fatal problem encountered while loading or linking syntaxes,
-/// reported through [`SyntaxSet::warnings`] / [`SyntaxSetBuilder::warnings`].
-/// The affected syntax is skipped or left without its `extends` applied,
-/// but the rest of the set loads normally.
-#[derive(Debug, Clone, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum LoadWarning {
-    /// A file in the loaded folder could not be parsed as a syntax and
-    /// was skipped.
-    SkippedFile {
-        /// The file that failed to load.
-        path: std::path::PathBuf,
-        /// The load error, rendered as text.
-        reason: String,
-    },
-    /// `extends` was not applied: the child's `version` differs from one
-    /// or more of its parents'.
-    ExtendsVersionMismatch {
-        /// The extending syntax's name.
-        syntax: String,
-    },
-    /// `extends` was not applied: the parents derive from different base
-    /// syntaxes.
-    ExtendsDivergentParents {
-        /// The extending syntax's name.
-        syntax: String,
-    },
-    /// Regexes could not be re-resolved after merging the parents'
-    /// variables into the child.
-    ExtendsRegexResolution {
-        /// The extending syntax's name.
-        syntax: String,
-        /// The resolution error, rendered as text.
-        reason: String,
-    },
-    /// An `extends` parent was not found (or the chain is circular); the
-    /// syntax is hidden from lookups.
-    ExtendsUnresolved {
-        /// The extending syntax's name.
-        syntax: String,
-        /// The unresolved parent list as written in the syntax file.
-        parents: String,
-    },
-}
-
-impl std::fmt::Display for LoadWarning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LoadWarning::SkippedFile { path, reason } => {
-                write!(f, "skipping {path:?}: {reason}")
-            }
-            LoadWarning::ExtendsVersionMismatch { syntax } => write!(
-                f,
-                "syntax '{syntax}' has a version mismatch with one or more parents; extends will not be applied"
-            ),
-            LoadWarning::ExtendsDivergentParents { syntax } => write!(
-                f,
-                "syntax '{syntax}' extends parents that derive from different base syntaxes; extends will not be applied"
-            ),
-            LoadWarning::ExtendsRegexResolution { syntax, reason } => write!(
-                f,
-                "failed to re-resolve regexes for '{syntax}' after extends: {reason}"
-            ),
-            LoadWarning::ExtendsUnresolved { syntax, parents } => write!(
-                f,
-                "syntax '{syntax}' extends '{parents}' but parent was not found or has circular dependency"
-            ),
-        }
-    }
-}
-
 /// A syntax set holds multiple syntaxes that have been linked together.
 ///
 /// Use a [`SyntaxSetBuilder`] to load syntax definitions and build a syntax set.
@@ -108,7 +37,7 @@ pub struct SyntaxSet {
 
     /// Warnings collected during syntax loading and linking.
     #[serde(skip_serializing, skip_deserializing, default)]
-    warnings: Vec<LoadWarning>,
+    warnings: Vec<String>,
 
     #[serde(skip_serializing, skip_deserializing, default = "OnceLock::new")]
     first_line_cache: OnceLock<FirstLineCache>,
@@ -166,7 +95,7 @@ pub(crate) struct LazyContexts {
 pub struct SyntaxSetBuilder {
     syntaxes: Vec<SyntaxDefinition>,
     path_syntaxes: Vec<(String, usize)>,
-    warnings: Vec<LoadWarning>,
+    warnings: Vec<String>,
     /// Tracks the `lines_include_newline` flag from the most recent
     /// `add_from_folder` call. Used by `resolve_extends` to re-resolve
     /// regexes with the correct newline mode after merging parent variables.
@@ -248,7 +177,7 @@ impl SyntaxSet {
     ///
     /// These include issues like skipped files, version mismatches, and
     /// unresolved `extends` references.
-    pub fn warnings(&self) -> &[LoadWarning] {
+    pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
 
@@ -603,7 +532,7 @@ impl SyntaxSetBuilder {
     ///
     /// These include issues like skipped files, version mismatches, and
     /// unresolved `extends` references that were previously printed to stderr.
-    pub fn warnings(&self) -> &[LoadWarning] {
+    pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
 
@@ -661,10 +590,8 @@ impl SyntaxSetBuilder {
                         self.syntaxes.push(syntax);
                     }
                     Err(err) => {
-                        self.warnings.push(LoadWarning::SkippedFile {
-                            path: entry.path().to_path_buf(),
-                            reason: err.to_string(),
-                        });
+                        self.warnings
+                            .push(format!("skipping {:?}: {}", entry.path(), err));
                     }
                 }
             }
@@ -872,7 +799,7 @@ impl SyntaxSetBuilder {
         syntax_definitions: Vec<SyntaxDefinition>,
         _path_syntaxes: &[(String, usize)],
         _lines_include_newline: bool,
-    ) -> (Vec<SyntaxDefinition>, Vec<LoadWarning>) {
+    ) -> (Vec<SyntaxDefinition>, Vec<String>) {
         (syntax_definitions, Vec::new())
     }
 
@@ -885,7 +812,7 @@ impl SyntaxSetBuilder {
         mut syntax_definitions: Vec<SyntaxDefinition>,
         path_syntaxes: &[(String, usize)],
         lines_include_newline: bool,
-    ) -> (Vec<SyntaxDefinition>, Vec<LoadWarning>) {
+    ) -> (Vec<SyntaxDefinition>, Vec<String>) {
         let mut warnings = Vec::new();
 
         // Build lookup maps: name -> index and path-suffix -> index
@@ -973,9 +900,11 @@ impl SyntaxSetBuilder {
                     .iter()
                     .all(|&pi| syntax_definitions[pi].version == child_version);
                 if !version_ok {
-                    warnings.push(LoadWarning::ExtendsVersionMismatch {
-                        syntax: syntax_definitions[child_idx].name.clone(),
-                    });
+                    warnings.push(format!(
+                        "syntax '{}' has a version mismatch with one or more parents; \
+                         extends will not be applied",
+                        syntax_definitions[child_idx].name
+                    ));
                     unresolved.remove(&child_idx);
                     syntax_roots.insert(child_idx, child_idx);
                     made_progress = true;
@@ -989,9 +918,11 @@ impl SyntaxSetBuilder {
                     .collect();
                 let common_root = parent_roots[0];
                 if !parent_roots.iter().all(|&r| r == common_root) {
-                    warnings.push(LoadWarning::ExtendsDivergentParents {
-                        syntax: syntax_definitions[child_idx].name.clone(),
-                    });
+                    warnings.push(format!(
+                        "syntax '{}' extends parents that derive from different base syntaxes; \
+                         extends will not be applied",
+                        syntax_definitions[child_idx].name
+                    ));
                     unresolved.remove(&child_idx);
                     syntax_roots.insert(child_idx, child_idx);
                     made_progress = true;
@@ -1132,10 +1063,10 @@ impl SyntaxSetBuilder {
                 if let Err(e) =
                     crate::parsing::yaml_load::re_resolve_all_regexes(child, lines_include_newline)
                 {
-                    warnings.push(LoadWarning::ExtendsRegexResolution {
-                        syntax: child.name.clone(),
-                        reason: e.to_string(),
-                    });
+                    warnings.push(format!(
+                        "failed to re-resolve regexes for '{}' after extends: {}",
+                        child.name, e
+                    ));
                 }
 
                 syntax_roots.insert(child_idx, common_root);
@@ -1153,10 +1084,10 @@ impl SyntaxSetBuilder {
                 } else {
                     e.join(", ")
                 };
-                warnings.push(LoadWarning::ExtendsUnresolved {
-                    syntax: syntax.name.clone(),
-                    parents: extends_str,
-                });
+                warnings.push(format!(
+                    "syntax '{}' extends '{}' but parent was not found or has circular dependency",
+                    syntax.name, extends_str,
+                ));
                 // Mark broken syntaxes as hidden so they won't be found by
                 // name/extension lookups and won't cause panics when used.
                 syntax.hidden = true;

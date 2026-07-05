@@ -9,7 +9,7 @@
 - `HighlightLines` / `HighlightFile` are deprecated: port to `syntect::io::HighlightedWriter`, which buffers during speculation and applies revisions internally.
 - `line_tokens_to_classed_spans` is deprecated: use `ClassedHTMLGenerator` or `HighlightedWriter::from_markup`.
 - `SCOPE_REPO` is gone: use `Scope::with_atom_strs` to read atom strings.
-- Loader and parser warnings are typed (`LoadWarning`, `ParseWarning`) instead of strings; `Display` preserves the previous message text.
+- Parser warnings on `ParseLineOutput` are typed (`ParseWarning`) instead of strings; `Display` preserves the previous message text.
 - The minimum supported Rust version is declared via `rust-version` (currently 1.89; policy remains the last three stable releases).
 
 ### Breaking changes
@@ -31,7 +31,6 @@
 - `branch_point`/`fail` backtracking is now handled by a trail-based re-execution engine: the parser checkpoints before each branch decision and deterministically re-parses the buffered window on `fail`, instead of surgically correcting already-emitted ops [#699] [#700] [#701]
 - `ParseLineOutput` reports cross-line corrections through `revised`: when present, it wholesale-replaces the entire still-uncommitted window, and the parser state at the window base is guaranteed immutable, so consumers reset once to a snapshot they already hold. `ParseState::speculative_lines()` reports how many returned lines may still be revised (`0` = safe to flush or cache), and `warnings` are typed as `ParseWarning` [#700]
 - Add `CommittedParser`, a wrapper for batch consumers that hands back each line's ops exactly once — only when no future `fail` can revise them — with `finish()` draining the tail at end of input [#700]
-- Loader warnings from `SyntaxSetBuilder::warnings()` / `SyntaxSet::warnings()` are typed as `LoadWarning` instead of strings, with `Display` output preserving the previous messages [#701]
 - Declare `rust-version = "1.89"` (MSRV policy remains the last three stable releases) [#701]
 - Add `syntect::io` module containing `HighlightedWriter<'a, R, W>`, a streaming highlighter that implements `std::io::Write` and handles branch-point backtracking, generic over the output sink (`Vec<u8>` by default, or any `io::Write` for streaming). Constructed via the new `HighlightedWriterBuilder`: pick a renderer category with `HighlightedWriter::from_themed` / `from_markup` / `from_renderer`, then chain `.with_output(...)` / `.with_state(...)` and finish with `.build()`. End-of-input cleanup runs implicitly via `Drop` on a best-effort basis; call `into_inner` explicitly when you need the inner sink back or want errors propagated [#627]
 - Add `syntect::rendering` module with a layered renderer trait design [#627]:

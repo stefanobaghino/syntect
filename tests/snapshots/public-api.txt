@@ -987,36 +987,6 @@ impl core::marker::Sync for syntect::parsing::ClearAmount
 impl core::marker::Unpin for syntect::parsing::ClearAmount
 impl core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::ClearAmount
 impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::ClearAmount
-#[non_exhaustive] pub enum syntect::parsing::LoadWarning
-pub syntect::parsing::LoadWarning::ExtendsDivergentParents
-pub syntect::parsing::LoadWarning::ExtendsDivergentParents::syntax: alloc::string::String
-pub syntect::parsing::LoadWarning::ExtendsRegexResolution
-pub syntect::parsing::LoadWarning::ExtendsRegexResolution::reason: alloc::string::String
-pub syntect::parsing::LoadWarning::ExtendsRegexResolution::syntax: alloc::string::String
-pub syntect::parsing::LoadWarning::ExtendsUnresolved
-pub syntect::parsing::LoadWarning::ExtendsUnresolved::parents: alloc::string::String
-pub syntect::parsing::LoadWarning::ExtendsUnresolved::syntax: alloc::string::String
-pub syntect::parsing::LoadWarning::ExtendsVersionMismatch
-pub syntect::parsing::LoadWarning::ExtendsVersionMismatch::syntax: alloc::string::String
-pub syntect::parsing::LoadWarning::SkippedFile
-pub syntect::parsing::LoadWarning::SkippedFile::path: std::path::PathBuf
-pub syntect::parsing::LoadWarning::SkippedFile::reason: alloc::string::String
-impl core::clone::Clone for syntect::parsing::LoadWarning
-pub fn syntect::parsing::LoadWarning::clone(&self) -> syntect::parsing::LoadWarning
-impl core::cmp::Eq for syntect::parsing::LoadWarning
-impl core::cmp::PartialEq for syntect::parsing::LoadWarning
-pub fn syntect::parsing::LoadWarning::eq(&self, other: &syntect::parsing::LoadWarning) -> bool
-impl core::fmt::Debug for syntect::parsing::LoadWarning
-pub fn syntect::parsing::LoadWarning::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::fmt::Display for syntect::parsing::LoadWarning
-pub fn syntect::parsing::LoadWarning::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for syntect::parsing::LoadWarning
-impl core::marker::Freeze for syntect::parsing::LoadWarning
-impl core::marker::Send for syntect::parsing::LoadWarning
-impl core::marker::Sync for syntect::parsing::LoadWarning
-impl core::marker::Unpin for syntect::parsing::LoadWarning
-impl core::panic::unwind_safe::RefUnwindSafe for syntect::parsing::LoadWarning
-impl core::panic::unwind_safe::UnwindSafe for syntect::parsing::LoadWarning
 #[non_exhaustive] pub enum syntect::parsing::ParseScopeError
 pub syntect::parsing::ParseScopeError::TooLong
 pub syntect::parsing::ParseScopeError::TooManyAtoms
@@ -1407,7 +1377,7 @@ pub fn syntect::parsing::SyntaxSet::into_builder(self) -> syntect::parsing::Synt
 pub fn syntect::parsing::SyntaxSet::load_from_folder<P: core::convert::AsRef<std::path::Path>>(folder: P) -> core::result::Result<syntect::parsing::SyntaxSet, syntect::LoadingError>
 pub fn syntect::parsing::SyntaxSet::new() -> syntect::parsing::SyntaxSet
 pub fn syntect::parsing::SyntaxSet::syntaxes(&self) -> &[syntect::parsing::SyntaxReference]
-pub fn syntect::parsing::SyntaxSet::warnings(&self) -> &[syntect::parsing::LoadWarning]
+pub fn syntect::parsing::SyntaxSet::warnings(&self) -> &[alloc::string::String]
 impl syntect::parsing::SyntaxSet
 pub fn syntect::parsing::SyntaxSet::load_defaults_newlines() -> syntect::parsing::SyntaxSet
 pub fn syntect::parsing::SyntaxSet::load_defaults_nonewlines() -> syntect::parsing::SyntaxSet
@@ -1435,7 +1405,7 @@ pub fn syntect::parsing::SyntaxSetBuilder::add_plain_text_syntax(&mut self)
 pub fn syntect::parsing::SyntaxSetBuilder::build(self) -> syntect::parsing::SyntaxSet
 pub fn syntect::parsing::SyntaxSetBuilder::new() -> syntect::parsing::SyntaxSetBuilder
 pub fn syntect::parsing::SyntaxSetBuilder::syntaxes(&self) -> &[syntect::parsing::syntax_definition::SyntaxDefinition]
-pub fn syntect::parsing::SyntaxSetBuilder::warnings(&self) -> &[syntect::parsing::LoadWarning]
+pub fn syntect::parsing::SyntaxSetBuilder::warnings(&self) -> &[alloc::string::String]
 impl core::clone::Clone for syntect::parsing::SyntaxSetBuilder
 pub fn syntect::parsing::SyntaxSetBuilder::clone(&self) -> syntect::parsing::SyntaxSetBuilder
 impl core::default::Default for syntect::parsing::SyntaxSetBuilder

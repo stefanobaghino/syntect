@@ -1226,7 +1226,6 @@ fn deeper_inner_bp_correction_does_not_double_outer_meta_scope() {
 /// constructs (lost `meta.enum.java`); the test remains as the
 /// ST-parity guard for that pop placement.
 #[test]
-#[ignore = "requires testdata/Packages submodule"]
 fn multi_line_annotation_eol_pop_survives_outer_replay() {
     let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
     let syntax = ss
@@ -1301,7 +1300,6 @@ fn multi_line_annotation_eol_pop_survives_outer_replay() {
 /// reflects the post-replay baseline plus only the in-line ops at
 /// position 0.
 #[test]
-#[ignore = "requires testdata/Packages submodule"]
 fn lrd_blank_line_keeps_meta_scope_active() {
     let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
     let md = ss

@@ -8840,7 +8840,6 @@ contexts:
     /// of outer's (identical prefix + appended `Pop` ops at outer's
     /// covered positions).
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn multi_line_annotation_eol_pop_survives_outer_replay() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let syntax = ss

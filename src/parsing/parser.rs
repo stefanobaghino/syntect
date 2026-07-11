@@ -8575,7 +8575,6 @@ contexts:
     /// pop must be skipped because the embedded main's mcs was never
     /// pushed.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn embed_scope_replaces_preserves_wrapper_mcs_across_inner_set() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss
@@ -8608,7 +8607,6 @@ contexts:
     /// strict `main`). The parent merge must prefer the own definition
     /// over the inherited one.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn zsh_for_markdown_uses_lenient_shebang_main_from_bash_for_markdown() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss
@@ -8659,7 +8657,6 @@ contexts:
     /// reflects the post-replay baseline plus only the in-line ops at
     /// position 0.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn lrd_blank_line_keeps_meta_scope_active() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss

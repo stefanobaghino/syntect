@@ -4646,7 +4646,6 @@ contexts:
     /// correct ops for the failing file (the replay-consistency issue
     /// is tracked as a follow-up).
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn cross_line_fail_with_nested_branch_does_not_panic() {
         use crate::parsing::SyntaxSet;
         use std::panic::AssertUnwindSafe;
@@ -4747,12 +4746,8 @@ contexts:
     /// harness-level cause: loads the real Packages Makefile syntax
     /// and parses two lines, asserting that after `bar := $(foo)\n`
     /// the scope stack no longer carries `meta.string.makefile` when
-    /// the next source line is parsed. Gated on the test-assets
-    /// being available; marked `#[ignore]` so it runs with
-    /// `cargo test -- --ignored` in the repo root (the Packages
-    /// submodule is required).
+    /// the next source line is parsed.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn makefile_meta_string_does_not_leak_past_eol() {
         use crate::parsing::SyntaxSet;
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();

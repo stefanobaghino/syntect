@@ -72,12 +72,8 @@ contexts:
 /// harness-level cause: loads the real Packages Makefile syntax
 /// and parses two lines, asserting that after `bar := $(foo)\n`
 /// the scope stack no longer carries `meta.string.makefile` when
-/// the next source line is parsed. Gated on the test-assets
-/// being available; marked `#[ignore]` so it runs with
-/// `cargo test -- --ignored` in the repo root (the Packages
-/// submodule is required).
+/// the next source line is parsed.
 #[test]
-#[ignore = "requires testdata/Packages submodule"]
 fn makefile_meta_string_does_not_leak_past_eol() {
     use crate::parsing::SyntaxSet;
     let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();

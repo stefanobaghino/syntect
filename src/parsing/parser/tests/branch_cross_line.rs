@@ -133,7 +133,6 @@ contexts:
 /// correct ops for the failing file (the replay-consistency issue
 /// is tracked as a follow-up).
 #[test]
-#[ignore = "requires testdata/Packages submodule"]
 fn cross_line_fail_with_nested_branch_does_not_panic() {
     use crate::parsing::SyntaxSet;
     use std::panic::AssertUnwindSafe;

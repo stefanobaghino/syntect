@@ -8627,7 +8627,6 @@ contexts:
     /// reflects the post-replay baseline plus only the in-line ops at
     /// position 0.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn lrd_blank_line_keeps_meta_scope_active() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss

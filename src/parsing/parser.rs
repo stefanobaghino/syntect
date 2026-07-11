@@ -9886,7 +9886,6 @@ contexts:
     /// of outer's (identical prefix + appended `Pop` ops at outer's
     /// covered positions).
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn multi_line_annotation_eol_pop_survives_outer_replay() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let syntax = ss
@@ -9953,7 +9952,6 @@ contexts:
     /// pop must be skipped because the embedded main's mcs was never
     /// pushed.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn embed_scope_replaces_preserves_wrapper_mcs_across_inner_set() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss
@@ -9967,12 +9965,14 @@ contexts:
                 let _ = stack.apply(op);
             }
         }
-        let bash = Scope::new("source.shell.bash").unwrap();
+        // Last `embed_scope` atom of Markdown's `fenced-code-block-bash-content`
+        // as of Packages v4202.
+        let bash = Scope::new("source.shell.bash.embedded.markdown").unwrap();
         assert!(
             stack.as_slice().contains(&bash),
-            "source.shell.bash (wrapper's last embed_scope token) must be \
-             on the stack after the embedded syntax's first `set:` fires; \
-             stack: {:?}",
+            "source.shell.bash.embedded.markdown (wrapper's last embed_scope \
+             token) must be on the stack after the embedded syntax's first \
+             `set:` fires; stack: {:?}",
             stack
         );
     }
@@ -9986,7 +9986,6 @@ contexts:
     /// strict `main`). The parent merge must prefer the own definition
     /// over the inherited one.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn zsh_for_markdown_uses_lenient_shebang_main_from_bash_for_markdown() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss
@@ -10037,7 +10036,6 @@ contexts:
     /// reflects the post-replay baseline plus only the in-line ops at
     /// position 0.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn lrd_blank_line_keeps_meta_scope_active() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss

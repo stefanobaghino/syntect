@@ -8115,7 +8115,6 @@ contexts:
     /// pop must be skipped because the embedded main's mcs was never
     /// pushed.
     #[test]
-    #[ignore = "requires testdata/Packages submodule"]
     fn embed_scope_replaces_preserves_wrapper_mcs_across_inner_set() {
         let ss = SyntaxSet::load_from_folder("testdata/Packages").unwrap();
         let md = ss

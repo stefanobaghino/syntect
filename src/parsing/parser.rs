@@ -8588,12 +8588,14 @@ contexts:
                 let _ = stack.apply(op);
             }
         }
-        let bash = Scope::new("source.shell.bash").unwrap();
+        // Last `embed_scope` atom of Markdown's `fenced-code-block-bash-content`
+        // as of Packages v4202.
+        let bash = Scope::new("source.shell.bash.embedded.markdown").unwrap();
         assert!(
             stack.as_slice().contains(&bash),
-            "source.shell.bash (wrapper's last embed_scope token) must be \
-             on the stack after the embedded syntax's first `set:` fires; \
-             stack: {:?}",
+            "source.shell.bash.embedded.markdown (wrapper's last embed_scope \
+             token) must be on the stack after the embedded syntax's first \
+             `set:` fires; stack: {:?}",
             stack
         );
     }
